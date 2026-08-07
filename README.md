@@ -41,8 +41,15 @@ sudo make install
 # that file must stay a full <component>, engines are already inline.
 ibus write-cache
 keyboopctl gnome-enable
+# gnome-enable also installs keyboop-switch@keyboop (GNOME Shell extension).
+# Wayland cannot reload new extensions live — log out and back in once,
+# then confirm:
+#   gnome-extensions info keyboop-switch@keyboop   # State: ACTIVE
 ibus restart
 ```
+
+Without that extension, convert still rewrites text, but the panel/layout
+stays on the old source (IBus alone is not enough on GNOME Wayland).
 
 Disable / restore GNOME xkb sources:
 
