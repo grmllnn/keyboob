@@ -178,6 +178,130 @@ void utf8_drop_suffix(std::string &s, int nchars) {
   s.resize(static_cast<size_t>(cut - p));
 }
 
+std::string utf8_slice_chars(const gchar *txt, guint from, guint to) {
+  if (!txt || to <= from)
+    return {};
+  const gchar *a = g_utf8_offset_to_pointer(txt, static_cast<glong>(from));
+  const gchar *b = g_utf8_offset_to_pointer(txt, static_cast<glong>(to));
+  return std::string(a, b);
+}
+
+std::string keymap_flip(const std::string &phrase) {
+  if (phrase.empty())
+    return {};
+  const bool source_cyr = keyboop::has_cyrillic(phrase);
+  const bool source_lat = keyboop::has_latin_letter(phrase);
+  if (!source_cyr && !source_lat)
+    return {};
+  const bool to_cyr = source_lat && !source_cyr;
+  std::string converted = keyboop::Keymap::convert(phrase, to_cyr);
+  if (converted == phrase)
+    return {};
+  return converted;
+}
+
+std::string read_primary_selection() {
+  gchar *out = nullptr;
+  gint status = 0;
+  GError *err = nullptr;
+  if (!g_spawn_command_line_sync("wl-paste -n -p", &out, nullptr, &status,
+                                 &err) ||
+      status != 0) {
+    g_clear_error(&err);
+    g_free(out);
+    return {};
+  }
+  std::string s = out ? out : "";
+  g_free(out);
+  while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
+    s.pop_back();
+  return s;
+}
+
+void forward_backspace(IBusEngine *engine) {
+  ibus_engine_forward_key_event(engine, IBUS_KEY_BackSpace, 22, 0);
+  ibus_engine_forward_key_event(engine, IBUS_KEY_BackSpace, 22,
+                                IBUS_RELEASE_MASK);
+}
+
+// Drop leftover highlight on the just-committed text (GTK often keeps it).
+void collapse_selection(IBusEngine *engine) {
+  ibus_engine_forward_key_event(engine, IBUS_KEY_Right, 114, 0);
+  ibus_engine_forward_key_event(engine, IBUS_KEY_Right, 114,
+                                IBUS_RELEASE_MASK);
+}
+
+// Replace [start,end) when we have reliable surrounding offsets.
+bool replace_char_range(IBusEngine *engine, KeyboopEngine *self, guint cursor,
+                        guint start, guint end, const std::string &expect,
+                        const std::string &insert) {
+  if (end <= start || insert.empty() || expect.empty())
+    return false;
+  const int n = static_cast<int>(end - start);
+  if (static_cast<int>(keyboop::utf8_length(expect)) != n)
+    return false;
+  const gint offset = static_cast<gint>(start) - static_cast<gint>(cursor);
+
+  self->muted = TRUE;
+  ibus_engine_hide_preedit_text(engine);
+
+  bool deleted = false;
+  IBusText *st = nullptr;
+  guint c2 = 0, a2 = 0;
+  ibus_engine_get_surrounding_text(engine, &st, &c2, &a2);
+  if (st) {
+    const gchar *txt = ibus_text_get_text(st);
+    if (txt && utf8_slice_chars(txt, start, end) == expect) {
+      ibus_engine_delete_surrounding_text(engine, offset,
+                                          static_cast<guint>(n));
+      deleted = true;
+    }
+    g_object_unref(st);
+  }
+  if (!deleted && end == cursor && cursor >= static_cast<guint>(n)) {
+    for (int i = 0; i < n; ++i)
+      forward_backspace(engine);
+    deleted = true;
+  }
+  if (!deleted) {
+    self->muted = FALSE;
+    return false;
+  }
+
+  commit_utf8(engine, insert);
+  collapse_selection(engine);
+  committed_clear(self);
+  self->core->clear_context();
+  self->muted = FALSE;
+  return true;
+}
+
+// Selection / PRIMARY: collapse highlight (Right), then erase exact length.
+// Never DeleteSurroundingText while a highlight may be active — GTK/Wayland
+// then also deletes neighbors («сраную тему» before the selection).
+bool replace_selected_text(IBusEngine *engine, KeyboopEngine *self,
+                           const std::string &selected,
+                           const std::string &insert) {
+  if (selected.empty() || insert.empty())
+    return false;
+  const int n = static_cast<int>(keyboop::utf8_length(selected));
+  if (n <= 0)
+    return false;
+
+  self->muted = TRUE;
+  ibus_engine_hide_preedit_text(engine);
+  // Drop highlight without deleting content; caret goes to the end edge.
+  collapse_selection(engine);
+  for (int i = 0; i < n; ++i)
+    forward_backspace(engine);
+  commit_utf8(engine, insert);
+  collapse_selection(engine);
+  committed_clear(self);
+  self->core->clear_context();
+  self->muted = FALSE;
+  return true;
+}
+
 // Delete the last `n` committed characters, then commit `insert`.
 // Updates `committed` to reflect the on-screen phrase (keeps earlier words).
 bool replace_committed_suffix(IBusEngine *engine, KeyboopEngine *self, int n,
@@ -196,8 +320,6 @@ bool replace_committed_suffix(IBusEngine *engine, KeyboopEngine *self, int n,
   IBusText *st = nullptr;
   guint cursor = 0, anchor = 0;
   ibus_engine_get_surrounding_text(engine, &st, &cursor, &anchor);
-  // Selection active → surrounding suffix check is unreliable; use BackSpace
-  // only when caret is a collapsed point at the end of our expect suffix.
   if (st && cursor == anchor && cursor >= static_cast<guint>(n)) {
     const gchar *txt = ibus_text_get_text(st);
     const gchar *end =
@@ -214,14 +336,12 @@ bool replace_committed_suffix(IBusEngine *engine, KeyboopEngine *self, int n,
     g_object_unref(st);
 
   if (!deleted) {
-    for (int i = 0; i < n; ++i) {
-      ibus_engine_forward_key_event(engine, IBUS_KEY_BackSpace, 22, 0);
-      ibus_engine_forward_key_event(engine, IBUS_KEY_BackSpace, 22,
-                                    IBUS_RELEASE_MASK);
-    }
+    for (int i = 0; i < n; ++i)
+      forward_backspace(engine);
   }
 
   commit_utf8(engine, insert);
+  collapse_selection(engine);
   utf8_drop_suffix(*self->committed, n);
   self->committed->append(insert);
   self->muted = FALSE;
@@ -375,26 +495,103 @@ static gboolean keyboop_process_key_event(IBusEngine *engine, guint keyval,
     if (skip_auto(self))
       return TRUE;
     refresh_active_keymap(self->layout);
+
+    IBusText *st = nullptr;
+    guint cursor = 0, anchor = 0;
+    ibus_engine_get_surrounding_text(engine, &st, &cursor, &anchor);
+    const gchar *txt = (st && ibus_text_get_text(st) &&
+                        ibus_text_get_text(st)[0] != '\0')
+                           ? ibus_text_get_text(st)
+                           : nullptr;
+
+    // --- Selection (IBus range, or PRIMARY that sits at the caret) ---
+    std::string selected;
+    guint sel_lo = 0, sel_hi = 0;
+    bool have_sel_range = false;
+    if (txt && cursor != anchor) {
+      sel_lo = cursor < anchor ? cursor : anchor;
+      sel_hi = cursor < anchor ? anchor : cursor;
+      selected = utf8_slice_chars(txt, sel_lo, sel_hi);
+      have_sel_range = !selected.empty();
+    } else if (txt) {
+      // Wayland: selection often not in cursor/anchor — PRIMARY still is.
+      std::string primary = read_primary_selection();
+      if (!primary.empty()) {
+        const int pn = static_cast<int>(keyboop::utf8_length(primary));
+        if (pn > 0 && cursor >= static_cast<guint>(pn) &&
+            utf8_slice_chars(txt, cursor - static_cast<guint>(pn), cursor) ==
+                primary) {
+          selected = primary;
+          sel_lo = cursor - static_cast<guint>(pn);
+          sel_hi = cursor;
+          have_sel_range = true;
+        } else {
+          // Highlight in the middle: PRIMARY equals some run near caret.
+          auto run = keyboop::layout_flip_at(txt, cursor);
+          if (!run.text.empty() && run.text == primary) {
+            selected = primary;
+            sel_lo = static_cast<guint>(run.start_cp);
+            sel_hi = static_cast<guint>(run.end_cp);
+            have_sel_range = true;
+          }
+          // Else: ignore stale PRIMARY — do not BackSpace blindly.
+        }
+      }
+    }
+
+    if (!selected.empty()) {
+      std::string converted = keymap_flip(selected);
+      if (st)
+        g_object_unref(st);
+      if (!converted.empty())
+        (void)replace_selected_text(engine, self, selected, converted);
+      return TRUE;
+    }
+
+    // --- No selection: same-script run at caret ---
+    if (txt) {
+      auto run = keyboop::layout_flip_at(txt, cursor);
+      if (!run.text.empty()) {
+        std::string converted = keymap_flip(run.text);
+        if (!converted.empty()) {
+          bool ok = false;
+          if (run.end_cp == cursor && self->committed &&
+              utf8_suffix(*self->committed,
+                          static_cast<int>(keyboop::utf8_length(run.text))) ==
+                  run.text) {
+            ok = replace_committed_suffix(
+                engine, self,
+                static_cast<int>(keyboop::utf8_length(run.text)), converted);
+            if (ok)
+              self->core->clear_context();
+          }
+          if (!ok)
+            ok = replace_char_range(engine, self, cursor,
+                                    static_cast<guint>(run.start_cp),
+                                    static_cast<guint>(run.end_cp), run.text,
+                                    converted);
+          if (st)
+            g_object_unref(st);
+          // Even on failure: do not fall through to committed tip — that is
+          // what scrambled mid-phrase / selection retries.
+          return TRUE;
+        }
+      }
+    }
+    if (st)
+      g_object_unref(st);
+
+    // --- Fallback: committed tip ---
     if (!self->committed || self->committed->empty())
       return TRUE;
-    // Mixed phrase → only trailing same-script run, so already-converted
-    // "привет андрей" stays when appending "rfr ltkf".
     const std::string phrase =
         keyboop::layout_flip_suffix(*self->committed);
-    if (phrase.empty())
-      return TRUE;
-    const bool source_cyr = keyboop::has_cyrillic(phrase);
-    const bool source_lat = keyboop::has_latin_letter(phrase);
-    if (!source_cyr && !source_lat)
-      return TRUE;
-    const bool to_cyr = source_lat && !source_cyr;
-    std::string converted = keyboop::Keymap::convert(phrase, to_cyr);
-    if (converted == phrase)
+    std::string converted = keymap_flip(phrase);
+    if (converted.empty())
       return TRUE;
     const int n = static_cast<int>(keyboop::utf8_length(phrase));
-    if (!replace_committed_suffix(engine, self, n, converted))
-      return TRUE;
-    self->core->clear_context();
+    if (replace_committed_suffix(engine, self, n, converted))
+      self->core->clear_context();
     return TRUE;
   }
 

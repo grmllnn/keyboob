@@ -31,9 +31,22 @@ static int g_fails = 0;
   } while (0)
 
 static void test_keymap() {
-  CHECK(Keymap::convert("ghbdtn", true) == "привет");
-  CHECK(Keymap::convert("привет", false) == "ghbdtn");
-  CHECK(Keymap::smart_convert("ghbdtn.", true) == "привет.");
+  CHECK(Keymap::convert("hf,jnftn", true) == "работает");
+  CHECK(Keymap::convert(",", true) == "б");
+  CHECK(Keymap::convert("работает", false) == "hf,jnftn");
+  {
+    // us↔ru pair must keep «,»→«б» (xkb shift-level used to overwrite it).
+    auto pair = build_xkb_pair(XkbLayoutId::parse("us"),
+                               XkbLayoutId::parse("ru"));
+    CHECK(pair.ok);
+    CHECK(pair.to_cyrillic.at(",") == "б");
+    CHECK(pair.to_latin.at("б") == ",");
+    auto &km = ActiveKeymap::shared();
+    km.use_pair(std::move(pair));
+    CHECK(km.convert("hf,jnftn", true) == "работает");
+    CHECK(km.convert(",", true) == "б");
+    km.use_builtin_us_ru();
+  }
   // yj; → нож when valid target says so
   CHECK(Keymap::smart_convert("yj;", true, [](const std::string &w) {
           return w == "нож";
@@ -46,8 +59,25 @@ static void test_keymap() {
   CHECK(layout_flip_suffix("ghbdtn fylhtq") == "ghbdtn fylhtq");
   CHECK(layout_flip_suffix("привет андрей rfr ltkf") == "rfr ltkf");
   CHECK(layout_flip_suffix("hello привет") == "привет");
+  CHECK(layout_flip_suffix(" nhb") == "nhb");
   CHECK(Keymap::convert(layout_flip_suffix("привет андрей rfr ltkf"), true) ==
         "как дела");
+  {
+    const std::string mid = "раз nhb два";
+    // caret after "nhb" (char offset 7: р а з _ n h b |)
+    auto run = layout_flip_at(mid, 7);
+    CHECK(run.text == "nhb");
+    CHECK(Keymap::convert(run.text, true) == "три");
+    // caret at end of mono Cyrillic phrase → whole phrase (reverse works)
+    auto all = layout_flip_at("раз два", 7);
+    CHECK(all.text == "раз два");
+    CHECK(Keymap::convert(all.text, false) == "hfp ldf");
+    // comma is the US key for «б» — must stay inside the latin run
+    const std::string phrase = "проверяем эту hf,jnftn yj yt lj rjywf";
+    auto tail = layout_flip_at(phrase, keyboop::utf8_length(phrase));
+    CHECK(tail.text == "hf,jnftn yj yt lj rjywf");
+    CHECK(Keymap::convert(tail.text, true) == "работает но не до конца");
+  }
   CHECK(to_lower_utf8("І") == "і");
   CHECK(to_lower_utf8("Ї") == "ї");
   CHECK(to_lower_utf8("Є") == "є");

@@ -206,15 +206,70 @@ inline int letter_script(uint32_t cp) {
 
 /// Hotkey target: whole phrase if mono-script; else trailing run of one script
 /// (so "привет андрей krfr ltkf" → "krfr ltkf", not a full re-flip).
+/// Edge whitespace is stripped so the separator space is not deleted/reinserted.
 inline std::string layout_flip_suffix(std::string_view phrase) {
   if (phrase.empty())
     return {};
+  std::string body;
   if (!has_cyrillic(phrase) || !has_latin_letter(phrase))
-    return std::string(phrase);
+    body = std::string(phrase);
+  else {
+    struct Cp {
+      size_t off;
+      size_t len;
+      uint32_t cp;
+    };
+    std::vector<Cp> cps;
+    cps.reserve(phrase.size());
+    {
+      Utf8Iter it(phrase);
+      while (it.ok()) {
+        const unsigned char *start = it.p;
+        uint32_t cp = it.next();
+        cps.push_back(
+            {static_cast<size_t>(
+                 start - reinterpret_cast<const unsigned char *>(phrase.data())),
+             static_cast<size_t>(it.p - start), cp});
+      }
+    }
+    int want = 0;
+    for (int i = static_cast<int>(cps.size()) - 1; i >= 0; --i) {
+      want = letter_script(cps[static_cast<size_t>(i)].cp);
+      if (want)
+        break;
+    }
+    if (!want)
+      return std::string(phrase);
 
+    size_t start_i = 0;
+    for (int i = static_cast<int>(cps.size()) - 1; i >= 0; --i) {
+      int sc = letter_script(cps[static_cast<size_t>(i)].cp);
+      if (sc && sc != want) {
+        start_i = static_cast<size_t>(i + 1);
+        break;
+      }
+    }
+    body = std::string(phrase.substr(cps[start_i].off));
+  }
+  while (!body.empty() && (body.front() == ' ' || body.front() == '\t'))
+    body.erase(body.begin());
+  while (!body.empty() && (body.back() == ' ' || body.back() == '\t'))
+    body.pop_back();
+  return body;
+}
+
+/// Same-script run touching the caret (char offset), for mid-phrase hotkey.
+/// Spaces glue same-script words; edge spaces are trimmed out of the range.
+struct LayoutFlipAt {
+  size_t start_cp = 0; // inclusive, in characters
+  size_t end_cp = 0;   // exclusive
+  std::string text;
+};
+
+inline LayoutFlipAt layout_flip_at(std::string_view phrase, size_t cursor_cp) {
+  LayoutFlipAt out;
   struct Cp {
     size_t off;
-    size_t len;
     uint32_t cp;
   };
   std::vector<Cp> cps;
@@ -224,35 +279,76 @@ inline std::string layout_flip_suffix(std::string_view phrase) {
     while (it.ok()) {
       const unsigned char *start = it.p;
       uint32_t cp = it.next();
-      cps.push_back({static_cast<size_t>(start - reinterpret_cast<const unsigned char *>(
+      cps.push_back({static_cast<size_t>(
+                         start - reinterpret_cast<const unsigned char *>(
                                      phrase.data())),
-                     static_cast<size_t>(it.p - start), cp});
+                     cp});
     }
   }
-  int want = 0;
-  for (int i = static_cast<int>(cps.size()) - 1; i >= 0; --i) {
-    want = letter_script(cps[static_cast<size_t>(i)].cp);
-    if (want)
-      break;
-  }
-  if (!want)
-    return std::string(phrase);
+  if (cps.empty())
+    return out;
+  if (cursor_cp > cps.size())
+    cursor_cp = cps.size();
 
-  size_t start_i = 0;
-  for (int i = static_cast<int>(cps.size()) - 1; i >= 0; --i) {
-    int sc = letter_script(cps[static_cast<size_t>(i)].cp);
-    if (sc && sc != want) {
-      start_i = static_cast<size_t>(i + 1);
+  int want = 0;
+  size_t anchor = 0;
+  bool found = false;
+  for (size_t i = cursor_cp; i > 0; --i) {
+    int sc = letter_script(cps[i - 1].cp);
+    if (sc) {
+      want = sc;
+      anchor = i - 1;
+      found = true;
       break;
     }
   }
-  // Drop leading whitespace so the separator space stays with the kept prefix.
-  while (start_i < cps.size() &&
-         (cps[start_i].cp == ' ' || cps[start_i].cp == '\t'))
-    ++start_i;
-  if (start_i >= cps.size())
-    return std::string(phrase);
-  return std::string(phrase.substr(cps[start_i].off));
+  if (!found) {
+    for (size_t i = cursor_cp; i < cps.size(); ++i) {
+      int sc = letter_script(cps[i].cp);
+      if (sc) {
+        want = sc;
+        anchor = i;
+        found = true;
+        break;
+      }
+    }
+  }
+  if (!found)
+    return out;
+
+  size_t lo = anchor;
+  size_t hi = anchor + 1;
+  // Glue: spaces AND punctuation/digits (sc==0). Stop only on the other
+  // alphabet — otherwise "hf,jnftn" (б = comma on US) splits the run and
+  // mid-phrase convert silently no-ops unless the user selects.
+  while (lo > 0) {
+    int sc = letter_script(cps[lo - 1].cp);
+    if (sc == want || sc == 0)
+      --lo;
+    else
+      break;
+  }
+  while (hi < cps.size()) {
+    int sc = letter_script(cps[hi].cp);
+    if (sc == want || sc == 0)
+      ++hi;
+    else
+      break;
+  }
+  while (lo < hi && (cps[lo].cp == ' ' || cps[lo].cp == '\t'))
+    ++lo;
+  while (hi > lo && (cps[hi - 1].cp == ' ' || cps[hi - 1].cp == '\t'))
+    --hi;
+  if (lo >= hi)
+    return out;
+
+  out.start_cp = lo;
+  out.end_cp = hi;
+  const size_t byte0 = cps[lo].off;
+  const size_t byte1 =
+      (hi < cps.size()) ? cps[hi].off : phrase.size();
+  out.text = std::string(phrase.substr(byte0, byte1 - byte0));
+  return out;
 }
 
 } // namespace keyboop

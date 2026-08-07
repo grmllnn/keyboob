@@ -1,4 +1,5 @@
 #include "xkb_pair.hpp"
+#include "keymap.hpp"
 #include "utf8.hpp"
 
 #include <xkbcommon/xkbcommon.h>
@@ -107,6 +108,17 @@ XkbPairMaps build_xkb_pair(const XkbLayoutId &latin, const XkbLayoutId &cyrillic
   if (latin.empty() || cyrillic.empty())
     return out;
 
+  // Standard US↔RU: trust the builtin table. xkb level-1 on the same key as
+  // «б» also defines RU «,» ↔ US «?», which overwrites «,»→«б» and turns
+  // hf,jnftn into ра,отает.
+  if (latin.layout == "us" && latin.variant.empty() &&
+      cyrillic.layout == "ru" && cyrillic.variant.empty()) {
+    out.to_cyrillic = Keymap::builtin_en_to_ru();
+    out.to_latin = Keymap::builtin_ru_to_en();
+    out.ok = true;
+    return out;
+  }
+
   auto *ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
   if (!ctx)
     return out;
@@ -126,6 +138,7 @@ XkbPairMaps build_xkb_pair(const XkbLayoutId &latin, const XkbLayoutId &cyrillic
   for (auto kc = min; kc <= max; ++kc) {
     if (!xkb_keymap_key_get_name(km_lat, kc))
       continue;
+    // Level 0 first; emplace keeps the unshifted binding on conflicts.
     for (int level = 0; level < 2; ++level) {
       const xkb_keysym_t *sa = nullptr;
       const xkb_keysym_t *sb = nullptr;
