@@ -1,0 +1,38 @@
+[Description/Keyboop]
+Enabled=Type: Boolean
+Enabled=Default: True
+Enabled=Description: Enable Keyboop
+
+AutoEnabled=Type: Boolean
+AutoEnabled=Default: True
+AutoEnabled=Description: Auto convert on word boundary
+
+OnSpace=Type: Boolean
+OnSpace=Default: True
+OnSpace=Description: Trigger on Space
+
+OnEnter=Type: Boolean
+OnEnter=Default: True
+OnEnter=Description: Trigger on Enter
+
+OnTab=Type: Boolean
+OnTab=Default: True
+OnTab=Description: Trigger on Tab
+
+LiveFix=Type: Boolean
+LiveFix=Default: True
+LiveFix=Description: Live fix mid-word
+
+ManualHotkey=Type: KeyList
+ManualHotkey=Default: Control+Alt+k
+ManualHotkey=Description: Manual convert hotkey
+
+HotkeyMode=Type: String
+HotkeyMode=Default: combo
+HotkeyMode=Description: Hotkey mode (combo|modkey|key|doubletap)
+
+DoubleTapTimeoutMs=Type: Integer
+DoubleTapTimeoutMs=Default: 250
+DoubleTapTimeoutMs=IntMin: 50
+DoubleTapTimeoutMs=IntMax: 2000
+DoubleTapTimeoutMs=Description: Double-tap timeout (ms)
