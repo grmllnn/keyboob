@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<component>
+    <name>org.freedesktop.IBus.Keyboop</name>
+    <description>Keyboop layout auto-switch</description>
+    <exec>@KEYBOOP_LIBEXECDIR@/ibus-engine-keyboop --ibus</exec>
+    <version>0.1.0</version>
+    <author>Keyboop</author>
+    <license>MIT</license>
+    <homepage>https://github.com/grmllnn/keyboob</homepage>
+    <textdomain>keyboop</textdomain>
+    <engines>
+        <engine>
+            <name>keyboop:us</name>
+            <longname>English (US)</longname>
+            <description>Layout auto-switch (Keyboop)</description>
+            <language>eng</language>
+            <license>MIT</license>
+            <author>Keyboop</author>
+            <icon>ibus-keyboard</icon>
+            <layout>us</layout>
+            <symbol>en</symbol>
+            <rank>99</rank>
+        </engine>
+        <engine>
+            <name>keyboop:ru</name>
+            <longname>Russian</longname>
+            <description>Layout auto-switch (Keyboop)</description>
+            <language>rus</language>
+            <license>MIT</license>
+            <author>Keyboop</author>
+            <icon>ibus-keyboard</icon>
+            <layout>ru</layout>
+            <symbol>ru</symbol>
+            <rank>99</rank>
+        </engine>
+    </engines>
+</component>

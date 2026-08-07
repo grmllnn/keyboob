@@ -1,10 +1,10 @@
 # Third-party notices
 
-## Языковые данные (триграммы и словари RU/EN)
+## Language data (trigrams + RU/EN word lists)
 
-Файлы `Sources/Keyboop/Resources/trigrams_ru.json`, `trigrams_en.json`,
-`words_ru.json`, `words_en.json` взяты из проекта **keyswitcher**
-(<https://github.com/graninilya/keyswitcher>), распространяемого под лицензией MIT.
+Files in `data/` (`trigrams_ru.json`, `trigrams_en.json`, `words_ru.json`,
+`words_en.json`) come from **keyswitcher**
+(<https://github.com/graninilya/keyswitcher>), MIT licensed.
 
 ```
 MIT License
@@ -24,6 +24,5 @@ copies or substantial portions of the Software.
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND...
 ```
 
-> На будущее: можно сгенерировать собственную триграммную модель из открытого
-> корпуса (wordfreq / FrequencyWords), чтобы не зависеть от внешних данных. Тогда
-> этот раздел можно убрать. Пока используем keyswitcher-данные (MIT это разрешает).
+> Optional later: generate a trigram model from an open corpus (wordfreq /
+> FrequencyWords) and drop this dependency.

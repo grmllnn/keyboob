@@ -1,10 +1,10 @@
 .build/
 .DS_Store
-Keyboop.app/
 *.xcodeproj
-linux/build/
-linux/.cmake-path
+/build/
+.cmake-path
 
-# Punto-копии для reverse-engineering — не коммитим бинарь
+# Local research dumps — not committed
 research/punto-switcher/PuntoSwitcher.app/
 PuntoS files/
+*.rpm

@@ -1,0 +1,12 @@
+# Example → copy to ~/.config/fcitx5/conf/keyboop.conf
+[Keyboop]
+Enabled=True
+AutoEnabled=True
+OnSpace=True
+OnEnter=True
+OnTab=True
+LiveFix=True
+SwitchLayout=True
+ManualHotkey=Control+Alt+k
+HotkeyMode=combo
+DoubleTapTimeoutMs=250
