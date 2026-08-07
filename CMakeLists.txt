@@ -59,6 +59,9 @@ target_include_directories(keyboop_platform PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src/platform
   ${CMAKE_CURRENT_SOURCE_DIR}/src/core)
 target_link_libraries(keyboop_platform PUBLIC keyboop_core)
+target_compile_definitions(keyboop_platform PUBLIC
+  KEYBOOP_EXTENSION_DIR="${CMAKE_CURRENT_SOURCE_DIR}/gnome-extension/keyboop-switch@keyboop")
+
 
 if(KEYBOOP_BUILD_TESTS)
   enable_testing()
@@ -124,3 +127,8 @@ install(TARGETS keyboopctl RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(DIRECTORY ${KEYBOOP_DATA_DIR}/
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/keyboop
         FILES_MATCHING PATTERN "*.json")
+install(DIRECTORY
+        "${CMAKE_CURRENT_SOURCE_DIR}/gnome-extension/keyboop-switch@keyboop/"
+        DESTINATION
+        "${CMAKE_INSTALL_DATAROOTDIR}/keyboop/gnome-extension/keyboop-switch@keyboop")
+

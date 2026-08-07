@@ -57,9 +57,13 @@ int main(int argc, char **argv) {
       std::cerr << "gnome-enable failed: " << err << "\n";
       return 1;
     }
+    std::string ext_err;
+    if (!keyboop::install_keyboop_switch_extension(&ext_err))
+      std::cerr << "note: switch extension: " << ext_err << "\n";
     std::cout << "GNOME input sources → Keyboop IBus engines.\n"
-              << "Restart IBus so labels/engines refresh:\n"
-              << "  ibus restart\n";
+              << "Installed keyboop-switch@keyboop (layout switch after convert).\n"
+              << "One-time: log out and back in (or reboot) so GNOME loads it.\n"
+              << "Then: ibus restart\n";
     return 0;
   }
   if (cmd == "gnome-disable") {

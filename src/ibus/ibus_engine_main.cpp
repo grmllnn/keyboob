@@ -13,8 +13,10 @@
 
 #include <ibus.h>
 
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <ctime>
 #include <string>
 #include <sys/stat.h>
 #include <vector>
@@ -348,6 +350,113 @@ bool replace_committed_suffix(IBusEngine *engine, KeyboopEngine *self, int n,
   return true;
 }
 
+void switch_log(const char *msg, const char *extra = nullptr) {
+  // ponytail: diagnose layout-switch until this path is proven on GNOME
+  FILE *f = fopen("/tmp/keyboop-switch.log", "a");
+  if (!f)
+    return;
+  fprintf(f, "%lld %s", static_cast<long long>(time(nullptr)), msg);
+  if (extra)
+    fprintf(f, " %s", extra);
+  fputc('\n', f);
+  fclose(f);
+}
+
+void maybe_switch_layout(bool to_cyrillic) {
+  // GNOME Wayland: ibus_bus_set_global_engine reports ok but Shell keeps the
+  // panel/xkb on the old source. Real switch = InputSource.activate() via the
+  // keyboop-switch@keyboop extension (D-Bus).
+  auto &km = keyboop::ActiveKeymap::shared();
+  const auto &id =
+      to_cyrillic ? km.cyrillic_layout() : km.latin_layout();
+  if (id.empty()) {
+    switch_log("skip empty layout id");
+    return;
+  }
+  std::string name = keyboop::keyboop_engine_name(id);
+  if (g_bus && ibus_bus_is_connected(g_bus)) {
+    IBusEngineDesc *cur = ibus_bus_get_global_engine(g_bus);
+    if (cur) {
+      const gchar *cur_name = ibus_engine_desc_get_name(cur);
+      const bool same = cur_name && name == cur_name;
+      if (cur_name)
+        switch_log(same ? "skip same" : "will switch", cur_name);
+      g_object_unref(cur);
+      if (same)
+        return;
+    }
+  }
+  switch_log("schedule", name.c_str());
+  gchar *hold = g_strdup(name.c_str());
+  g_timeout_add(
+      80,
+      [](gpointer data) -> gboolean {
+        gchar *engine = static_cast<gchar *>(data);
+        switch_log("timeout fire", engine);
+        // 1) Shell extension — updates panel + IBus together
+        gchar *argv[] = {
+            const_cast<gchar *>("gdbus"),
+            const_cast<gchar *>("call"),
+            const_cast<gchar *>("--session"),
+            const_cast<gchar *>("--dest"),
+            const_cast<gchar *>("org.gnome.Shell"),
+            const_cast<gchar *>("--object-path"),
+            const_cast<gchar *>("/org/gnome/Shell/Extensions/KeyboopSwitch"),
+            const_cast<gchar *>("--method"),
+            const_cast<gchar *>(
+                "org.gnome.Shell.Extensions.KeyboopSwitch.Activate"),
+            engine,
+            nullptr};
+        GPid pid = 0;
+        GError *spawn_err = nullptr;
+        if (g_spawn_async(nullptr, argv, nullptr,
+                          static_cast<GSpawnFlags>(G_SPAWN_SEARCH_PATH |
+                                                   G_SPAWN_DO_NOT_REAP_CHILD |
+                                                   G_SPAWN_STDOUT_TO_DEV_NULL |
+                                                   G_SPAWN_STDERR_TO_DEV_NULL),
+                          nullptr, nullptr, &pid, &spawn_err)) {
+          switch_log("shell activate spawned", engine);
+          g_child_watch_add(
+              pid,
+              [](GPid p, gint status, gpointer eng) {
+                g_spawn_close_pid(p);
+                const bool ok = g_spawn_check_wait_status(status, nullptr);
+                switch_log(ok ? "shell activate exit-ok" : "shell activate exit-fail",
+                           static_cast<gchar *>(eng));
+                // Fallback if extension missing / failed: IBus-only (panel may
+                // stay wrong on Wayland — better than nothing).
+                if (!ok && g_bus && ibus_bus_is_connected(g_bus)) {
+                  ibus_bus_set_global_engine_async(g_bus,
+                                                   static_cast<gchar *>(eng),
+                                                   -1, nullptr, nullptr,
+                                                   nullptr);
+                  switch_log("fallback set_global_engine",
+                             static_cast<gchar *>(eng));
+                }
+                g_free(eng);
+              },
+              engine);
+          return G_SOURCE_REMOVE;
+        }
+        if (spawn_err) {
+          switch_log("shell activate spawn-err", spawn_err->message);
+          g_error_free(spawn_err);
+        }
+        if (g_bus && ibus_bus_is_connected(g_bus)) {
+          ibus_bus_set_global_engine_async(g_bus, engine, -1, nullptr, nullptr,
+                                           nullptr);
+          switch_log("fallback set_global_engine", engine);
+        }
+        g_free(engine);
+        return G_SOURCE_REMOVE;
+      },
+      hold);
+}
+
+bool flip_to_cyrillic(const std::string &phrase) {
+  return keyboop::has_latin_letter(phrase) && !keyboop::has_cyrillic(phrase);
+}
+
 bool apply_replace(IBusEngine *engine, KeyboopEngine *self,
                    const keyboop::ReplaceAction &act,
                    const std::string &word_suffix) {
@@ -359,10 +468,11 @@ bool apply_replace(IBusEngine *engine, KeyboopEngine *self,
   const int n = static_cast<int>(keyboop::utf8_length(word_suffix));
   if (n <= 0 || utf8_suffix(*self->committed, n) != word_suffix)
     return false;
-  return replace_committed_suffix(engine, self, n, act.insert);
+  if (!replace_committed_suffix(engine, self, n, act.insert))
+    return false;
+  maybe_switch_layout(act.switch_to_cyrillic);
+  return true;
 }
-
-void maybe_switch_layout(bool /*to_cyrillic*/) {}
 
 G_DEFINE_TYPE(KeyboopEngine, keyboop_engine, IBUS_TYPE_ENGINE)
 
@@ -541,10 +651,12 @@ static gboolean keyboop_process_key_event(IBusEngine *engine, guint keyval,
 
     if (!selected.empty()) {
       std::string converted = keymap_flip(selected);
+      const bool to_cyr = flip_to_cyrillic(selected);
       if (st)
         g_object_unref(st);
-      if (!converted.empty())
-        (void)replace_selected_text(engine, self, selected, converted);
+      if (!converted.empty() &&
+          replace_selected_text(engine, self, selected, converted))
+        maybe_switch_layout(to_cyr);
       return TRUE;
     }
 
@@ -554,6 +666,7 @@ static gboolean keyboop_process_key_event(IBusEngine *engine, guint keyval,
       if (!run.text.empty()) {
         std::string converted = keymap_flip(run.text);
         if (!converted.empty()) {
+          const bool to_cyr = flip_to_cyrillic(run.text);
           bool ok = false;
           if (run.end_cp == cursor && self->committed &&
               utf8_suffix(*self->committed,
@@ -570,6 +683,8 @@ static gboolean keyboop_process_key_event(IBusEngine *engine, guint keyval,
                                     static_cast<guint>(run.start_cp),
                                     static_cast<guint>(run.end_cp), run.text,
                                     converted);
+          if (ok)
+            maybe_switch_layout(to_cyr);
           if (st)
             g_object_unref(st);
           // Even on failure: do not fall through to committed tip — that is
@@ -589,9 +704,12 @@ static gboolean keyboop_process_key_event(IBusEngine *engine, guint keyval,
     std::string converted = keymap_flip(phrase);
     if (converted.empty())
       return TRUE;
+    const bool to_cyr = flip_to_cyrillic(phrase);
     const int n = static_cast<int>(keyboop::utf8_length(phrase));
-    if (replace_committed_suffix(engine, self, n, converted))
+    if (replace_committed_suffix(engine, self, n, converted)) {
       self->core->clear_context();
+      maybe_switch_layout(to_cyr);
+    }
     return TRUE;
   }
 

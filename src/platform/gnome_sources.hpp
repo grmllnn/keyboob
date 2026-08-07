@@ -37,4 +37,11 @@ bool gnome_disable_keyboop(std::string *err = nullptr);
 
 std::string gnome_sources_backup_path();
 
+/// Copy + enable keyboop-switch@keyboop (needs one GNOME session restart).
+bool install_keyboop_switch_extension(std::string *err = nullptr);
+
+/// Activate a keyboop IBus engine after convert via detached `ibus engine`
+/// (must not wait — switch tears down the calling engine process).
+bool activate_gnome_ibus_engine(const std::string &engine_name);
+
 } // namespace keyboop

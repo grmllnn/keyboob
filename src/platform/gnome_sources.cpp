@@ -169,19 +169,58 @@ std::vector<InputSource> read_gnome_input_sources() {
   return parse_gnome_sources_value(raw);
 }
 
-bool write_gnome_input_sources(const std::vector<InputSource> &sources) {
-  auto val = shell_quote_gsettings_sources(sources);
+bool run_argv_wait(const char *const *argv) {
   pid_t pid = fork();
   if (pid < 0)
     return false;
   if (pid == 0) {
-    const char *argv[] = {"gsettings",
-                          "set",
-                          "org.gnome.desktop.input-sources",
-                          "sources",
-                          val.c_str(),
-                          nullptr};
-    execvp("gsettings", const_cast<char *const *>(argv));
+    execvp(argv[0], const_cast<char *const *>(argv));
+    _exit(127);
+  }
+  int status = 0;
+  if (waitpid(pid, &status, 0) < 0)
+    return false;
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+bool write_gnome_input_sources(const std::vector<InputSource> &sources) {
+  auto val = shell_quote_gsettings_sources(sources);
+  const char *argv[] = {"gsettings",
+                        "set",
+                        "org.gnome.desktop.input-sources",
+                        "sources",
+                        val.c_str(),
+                        nullptr};
+  return run_argv_wait(argv);
+}
+
+bool activate_gnome_ibus_engine(const std::string &engine_name) {
+  // Safe charset only — passed as exec argv (no shell).
+  if (engine_name.empty() || engine_name.size() >= 64 ||
+      engine_name.find_first_not_of(
+          "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:_-") !=
+          std::string::npos)
+    return false;
+  // Must copy before fork: caller often passes a temporary std::string; after
+  // parent returns that storage is gone and grandchild would UAF → ibus gets
+  // garbage and SetGlobalEngine fails silently.
+  char name[64];
+  std::snprintf(name, sizeof(name), "%s", engine_name.c_str());
+  // Double-fork + delay: `ibus engine` tears down THIS engine process.
+  // Waiting on that switch from inside the engine deadlocks input (freeze).
+  pid_t pid = fork();
+  if (pid < 0)
+    return false;
+  if (pid == 0) {
+    pid_t grand = fork();
+    if (grand < 0)
+      _exit(127);
+    if (grand > 0)
+      _exit(0); // intermediate exits; parent waitpid returns immediately
+    setsid();
+    usleep(100000); // 100ms — let commit/idle finish before teardown
+    const char *argv[] = {"ibus", "engine", name, nullptr};
+    execvp("ibus", const_cast<char *const *>(argv));
     _exit(127);
   }
   int status = 0;
@@ -213,6 +252,99 @@ bool component_xml_looks_sane() {
       return true;
   }
   return false;
+}
+
+bool install_keyboop_switch_extension(std::string *err) {
+  const char *home = std::getenv("HOME");
+  if (!home) {
+    if (err)
+      *err = "HOME unset";
+    return false;
+  }
+  fs::path dst = fs::path(home) /
+                 ".local/share/gnome-shell/extensions/keyboop-switch@keyboop";
+  std::vector<fs::path> candidates;
+  if (const char *env = std::getenv("KEYBOOP_EXTENSION_DIR"))
+    candidates.emplace_back(env);
+#ifdef KEYBOOP_EXTENSION_DIR
+  candidates.emplace_back(KEYBOOP_EXTENSION_DIR);
+#endif
+  candidates.emplace_back(
+      "/usr/share/keyboop/gnome-extension/keyboop-switch@keyboop");
+  candidates.emplace_back(
+      "/usr/local/share/keyboop/gnome-extension/keyboop-switch@keyboop");
+  // Dev tree next to cwd / repo
+  candidates.emplace_back(
+      "gnome-extension/keyboop-switch@keyboop");
+
+  fs::path src;
+  for (const auto &c : candidates) {
+    if (fs::exists(c / "metadata.json") && fs::exists(c / "extension.js")) {
+      src = c;
+      break;
+    }
+  }
+  if (src.empty()) {
+    if (err)
+      *err = "keyboop-switch extension files not found "
+             "(set KEYBOOP_EXTENSION_DIR or install package data)";
+    return false;
+  }
+  std::error_code ec;
+  fs::create_directories(dst, ec);
+  fs::copy_file(src / "metadata.json", dst / "metadata.json",
+                fs::copy_options::overwrite_existing, ec);
+  if (ec) {
+    if (err)
+      *err = "copy metadata.json failed: " + ec.message();
+    return false;
+  }
+  fs::copy_file(src / "extension.js", dst / "extension.js",
+                fs::copy_options::overwrite_existing, ec);
+  if (ec) {
+    if (err)
+      *err = "copy extension.js failed: " + ec.message();
+    return false;
+  }
+  // Prefer enabled-extensions; gnome-extensions enable needs Shell to know
+  // the UUID (after next login). Best-effort now.
+  run_cmd_capture(
+      "gsettings get org.gnome.shell enabled-extensions 2>/dev/null", nullptr);
+  {
+    int rc = 0;
+    auto cur = run_cmd_capture(
+        "gsettings get org.gnome.shell enabled-extensions 2>/dev/null", &rc);
+    const char *uuid = "keyboop-switch@keyboop";
+    if (cur.find(uuid) == std::string::npos) {
+      std::string next;
+      if (cur.find("@as []") != std::string::npos || cur == "[]\n" ||
+          cur == "[]") {
+        next = std::string("['") + uuid + "']";
+      } else {
+        // trim trailing ]
+        auto pos = cur.find_last_of(']');
+        if (pos == std::string::npos)
+          next = std::string("['") + uuid + "']";
+        else {
+          next = cur.substr(0, pos);
+          while (!next.empty() &&
+                 (next.back() == '\n' || next.back() == ' '))
+            next.pop_back();
+          next += std::string(", '") + uuid + "']";
+        }
+      }
+      const char *argv[] = {"gsettings",
+                            "set",
+                            "org.gnome.shell",
+                            "enabled-extensions",
+                            next.c_str(),
+                            nullptr};
+      run_argv_wait(argv);
+    }
+  }
+  run_cmd_capture(
+      "gnome-extensions enable keyboop-switch@keyboop 2>/dev/null", nullptr);
+  return true;
 }
 
 bool gnome_enable_keyboop(std::string *err) {
@@ -263,6 +395,7 @@ bool gnome_enable_keyboop(std::string *err) {
   }
   // Registry cache keeps stale language/symbol until rewritten (en₁/en₂).
   run_cmd_capture("ibus write-cache 2>/dev/null", nullptr);
+  install_keyboop_switch_extension(nullptr); // best-effort; needs session restart
   return true;
 }
 

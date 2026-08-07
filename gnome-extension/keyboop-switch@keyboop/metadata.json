@@ -1,0 +1,8 @@
+{
+  "name": "Keyboop Switch",
+  "description": "D-Bus API to activate GNOME input sources after Keyboop convert",
+  "uuid": "keyboop-switch@keyboop",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "url": "https://github.com/grmllnn/keyboob",
+  "version": 1
+}
