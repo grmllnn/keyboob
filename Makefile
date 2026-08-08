@@ -8,13 +8,25 @@ FCITX ?= OFF
 CMAKE_BUILD_TYPE ?= Release
 GENERATOR ?= $(shell command -v ninja >/dev/null 2>&1 && echo Ninja || echo "Unix Makefiles")
 
-.PHONY: all configure build test install clean distclean
+.PHONY: all configure build test install clean distclean deps
 
 all: test
+
+deps:
+	@if command -v pacman >/dev/null 2>&1; then \
+		sudo pacman -S --needed base-devel cmake ninja nlohmann-json libxkbcommon ibus pkgconf; \
+	elif command -v dnf >/dev/null 2>&1; then \
+		sudo dnf install -y cmake ninja-build gcc-c++ json-devel libxkbcommon-devel ibus-devel glib2-devel; \
+	elif command -v apt-get >/dev/null 2>&1; then \
+		sudo apt-get install -y cmake ninja-build build-essential nlohmann-json3-dev libxkbcommon-dev libibus-1.0-dev pkg-config; \
+	else \
+		echo "Unsupported package manager. Install dependencies manually." && exit 1; \
+	fi
 
 configure: $(BUILD)/CMakeCache.txt
 
 $(BUILD)/CMakeCache.txt: CMakeLists.txt
+	@command -v cmake >/dev/null 2>&1 || $(MAKE) deps
 	@if [ -f "$(BUILD)/CMakeCache.txt" ]; then \
 	  cached=$$(grep -E '^CMAKE_HOME_DIRECTORY:' "$(BUILD)/CMakeCache.txt" | cut -d= -f2-); \
 	  if [ -n "$$cached" ] && [ "$$cached" != "$(CURDIR)" ]; then \
