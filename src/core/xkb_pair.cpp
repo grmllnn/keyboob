@@ -7,6 +7,8 @@
 #include <cstring>
 #include <unordered_map>
 
+#include <mutex>
+
 namespace keyboop {
 namespace {
 
@@ -43,7 +45,17 @@ XkbLayoutId XkbLayoutId::parse(std::string_view id) {
     return out;
   auto plus = id.find('+');
   if (plus == std::string_view::npos) {
-    out.layout = std::string(id);
+    auto paren = id.find('(');
+    if (paren != std::string_view::npos) {
+      out.layout = std::string(id.substr(0, paren));
+      auto endp = id.find(')', paren);
+      if (endp != std::string_view::npos)
+        out.variant = std::string(id.substr(paren + 1, endp - paren - 1));
+      else
+        out.variant = std::string(id.substr(paren + 1));
+    } else {
+      out.layout = std::string(id);
+    }
   } else {
     out.layout = std::string(id.substr(0, plus));
     out.variant = std::string(id.substr(plus + 1));
@@ -60,9 +72,13 @@ std::string XkbLayoutId::id() const {
 LayoutScript detect_layout_script(const XkbLayoutId &id) {
   // Cache: loading an xkb keymap is expensive; scripts don't change at runtime.
   static std::unordered_map<std::string, LayoutScript> cache;
+  static std::mutex cache_mutex;
   const std::string key = id.id();
-  if (auto it = cache.find(key); it != cache.end())
-    return it->second;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    if (auto it = cache.find(key); it != cache.end())
+      return it->second;
+  }
 
   auto *ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
   if (!ctx)
@@ -97,7 +113,10 @@ LayoutScript detect_layout_script(const XkbLayoutId &id) {
     result = LayoutScript::Cyrillic;
   else if (latin > cyr && latin >= 5)
     result = LayoutScript::Latin;
-  cache.emplace(key, result);
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    cache.emplace(key, result);
+  }
   return result;
 }
 

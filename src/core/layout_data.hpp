@@ -21,7 +21,24 @@ public:
   const std::unordered_set<std::string> &words_en() const { return words_en_; }
 
   bool has_word_ru(const std::string &w) const {
-    return words_ru_.count(w) != 0;
+    if (words_ru_.count(w) != 0)
+      return true;
+    // Normalize ё -> е and check
+    std::string e_form;
+    e_form.reserve(w.size());
+    for (size_t i = 0; i < w.size(); ++i) {
+      unsigned char c1 = static_cast<unsigned char>(w[i]);
+      if (c1 == 0xd1 && i + 1 < w.size() && static_cast<unsigned char>(w[i + 1]) == 0x91) { // ё
+        e_form += "е";
+        ++i;
+      } else if (c1 == 0xd0 && i + 1 < w.size() && static_cast<unsigned char>(w[i + 1]) == 0x81) { // Ё
+        e_form += "Е";
+        ++i;
+      } else {
+        e_form.push_back(w[i]);
+      }
+    }
+    return words_ru_.count(e_form) != 0;
   }
   bool has_word_en(const std::string &w) const {
     return words_en_.count(w) != 0;

@@ -183,8 +183,15 @@ void utf8_drop_suffix(std::string &s, int nchars) {
 std::string utf8_slice_chars(const gchar *txt, guint from, guint to) {
   if (!txt || to <= from)
     return {};
+  // Validate offsets against actual string length to avoid OOB in
+  // g_utf8_offset_to_pointer (which can SIGSEGV Mutter/gnome-shell).
+  const guint len = static_cast<guint>(g_utf8_strlen(txt, -1));
+  if (from >= len || to > len)
+    return {};
   const gchar *a = g_utf8_offset_to_pointer(txt, static_cast<glong>(from));
   const gchar *b = g_utf8_offset_to_pointer(txt, static_cast<glong>(to));
+  if (b < a)
+    return {};
   return std::string(a, b);
 }
 
@@ -221,17 +228,20 @@ std::string read_primary_selection() {
 }
 
 void forward_backspace(IBusEngine *engine) {
-  ibus_engine_forward_key_event(engine, IBUS_KEY_BackSpace, 22, 0);
-  ibus_engine_forward_key_event(engine, IBUS_KEY_BackSpace, 22,
+  ibus_engine_forward_key_event(engine, IBUS_KEY_BackSpace, 0, 0);
+  ibus_engine_forward_key_event(engine, IBUS_KEY_BackSpace, 0,
                                 IBUS_RELEASE_MASK);
 }
 
-// Drop leftover highlight on the just-committed text (GTK often keeps it).
-void collapse_selection(IBusEngine *engine) {
-  ibus_engine_forward_key_event(engine, IBUS_KEY_Right, 114, 0);
-  ibus_engine_forward_key_event(engine, IBUS_KEY_Right, 114,
+void forward_delete(IBusEngine *engine) {
+  ibus_engine_forward_key_event(engine, IBUS_KEY_Delete, 0, 0);
+  ibus_engine_forward_key_event(engine, IBUS_KEY_Delete, 0,
                                 IBUS_RELEASE_MASK);
 }
+
+// ponytail: cap forward_backspace bursts — too many synthetic key events
+// in one go can destabilize Mutter/Wayland.
+static constexpr int kMaxForwardBackspace = 64;
 
 // Replace [start,end) when we have reliable surrounding offsets.
 bool replace_char_range(IBusEngine *engine, KeyboopEngine *self, guint cursor,
@@ -242,62 +252,42 @@ bool replace_char_range(IBusEngine *engine, KeyboopEngine *self, guint cursor,
   const int n = static_cast<int>(end - start);
   if (static_cast<int>(keyboop::utf8_length(expect)) != n)
     return false;
-  const gint offset = static_cast<gint>(start) - static_cast<gint>(cursor);
+  if (n > kMaxForwardBackspace)
+    return false; // ponytail: refuse absurdly long replacements
 
   self->muted = TRUE;
   ibus_engine_hide_preedit_text(engine);
 
-  bool deleted = false;
-  IBusText *st = nullptr;
-  guint c2 = 0, a2 = 0;
-  ibus_engine_get_surrounding_text(engine, &st, &c2, &a2);
-  if (st) {
-    const gchar *txt = ibus_text_get_text(st);
-    if (txt && utf8_slice_chars(txt, start, end) == expect) {
-      ibus_engine_delete_surrounding_text(engine, offset,
-                                          static_cast<guint>(n));
-      deleted = true;
-    }
-    g_object_unref(st);
-  }
-  if (!deleted && end == cursor && cursor >= static_cast<guint>(n)) {
-    for (int i = 0; i < n; ++i)
+  // Erase characters before cursor with Backspace
+  if (cursor > start) {
+    guint n_before = cursor - start;
+    for (guint i = 0; i < n_before; ++i)
       forward_backspace(engine);
-    deleted = true;
   }
-  if (!deleted) {
-    self->muted = FALSE;
-    return false;
+  // Erase characters after cursor with Delete
+  if (end > cursor) {
+    guint n_after = end - cursor;
+    for (guint i = 0; i < n_after; ++i)
+      forward_delete(engine);
   }
 
   commit_utf8(engine, insert);
-  collapse_selection(engine);
   committed_clear(self);
   self->core->clear_context();
   self->muted = FALSE;
   return true;
 }
 
-// Selection / PRIMARY: collapse highlight (Right), then erase exact length.
-// Never DeleteSurroundingText while a highlight may be active — GTK/Wayland
-// then also deletes neighbors («сраную тему» before the selection).
+// Selection: commit directly replaces selection in IM context.
 bool replace_selected_text(IBusEngine *engine, KeyboopEngine *self,
                            const std::string &selected,
                            const std::string &insert) {
   if (selected.empty() || insert.empty())
     return false;
-  const int n = static_cast<int>(keyboop::utf8_length(selected));
-  if (n <= 0)
-    return false;
 
   self->muted = TRUE;
   ibus_engine_hide_preedit_text(engine);
-  // Drop highlight without deleting content; caret goes to the end edge.
-  collapse_selection(engine);
-  for (int i = 0; i < n; ++i)
-    forward_backspace(engine);
   commit_utf8(engine, insert);
-  collapse_selection(engine);
   committed_clear(self);
   self->core->clear_context();
   self->muted = FALSE;
@@ -310,6 +300,8 @@ bool replace_committed_suffix(IBusEngine *engine, KeyboopEngine *self, int n,
                               const std::string &insert) {
   if (!self->committed || n <= 0)
     return false;
+  if (n > kMaxForwardBackspace)
+    return false; // ponytail: refuse absurdly long replacements
   const std::string expect = utf8_suffix(*self->committed, n);
   if (expect.empty() ||
       static_cast<int>(keyboop::utf8_length(expect)) != n)
@@ -318,32 +310,10 @@ bool replace_committed_suffix(IBusEngine *engine, KeyboopEngine *self, int n,
   self->muted = TRUE;
   ibus_engine_hide_preedit_text(engine);
 
-  bool deleted = false;
-  IBusText *st = nullptr;
-  guint cursor = 0, anchor = 0;
-  ibus_engine_get_surrounding_text(engine, &st, &cursor, &anchor);
-  if (st && cursor == anchor && cursor >= static_cast<guint>(n)) {
-    const gchar *txt = ibus_text_get_text(st);
-    const gchar *end =
-        g_utf8_offset_to_pointer(txt, static_cast<glong>(cursor));
-    const gchar *start =
-        g_utf8_offset_to_pointer(txt, static_cast<glong>(cursor) - n);
-    std::string suffix(start, end);
-    if (suffix == expect) {
-      ibus_engine_delete_surrounding_text(engine, -n, static_cast<guint>(n));
-      deleted = true;
-    }
-  }
-  if (st)
-    g_object_unref(st);
-
-  if (!deleted) {
-    for (int i = 0; i < n; ++i)
-      forward_backspace(engine);
-  }
+  for (int i = 0; i < n; ++i)
+    forward_backspace(engine);
 
   commit_utf8(engine, insert);
-  collapse_selection(engine);
   utf8_drop_suffix(*self->committed, n);
   self->committed->append(insert);
   self->muted = FALSE;
@@ -351,15 +321,8 @@ bool replace_committed_suffix(IBusEngine *engine, KeyboopEngine *self, int n,
 }
 
 void switch_log(const char *msg, const char *extra = nullptr) {
-  // ponytail: diagnose layout-switch until this path is proven on GNOME
-  FILE *f = fopen("/tmp/keyboop-switch.log", "a");
-  if (!f)
-    return;
-  fprintf(f, "%lld %s", static_cast<long long>(time(nullptr)), msg);
-  if (extra)
-    fprintf(f, " %s", extra);
-  fputc('\n', f);
-  fclose(f);
+  (void)msg;
+  (void)extra;
 }
 
 void maybe_switch_layout(bool to_cyrillic) {
@@ -548,12 +511,17 @@ static void keyboop_engine_constructed(GObject *object) {
 static void keyboop_engine_dispose(GObject *object) {
   auto *self = reinterpret_cast<KeyboopEngine *>(object);
   self->core = nullptr; // shared
+  g_clear_pointer(&self->engine_name, g_free);
+  G_OBJECT_CLASS(keyboop_engine_parent_class)->dispose(object);
+}
+
+static void keyboop_engine_finalize(GObject *object) {
+  auto *self = reinterpret_cast<KeyboopEngine *>(object);
   delete self->layout;
   self->layout = nullptr;
   delete self->committed;
   self->committed = nullptr;
-  g_clear_pointer(&self->engine_name, g_free);
-  G_OBJECT_CLASS(keyboop_engine_parent_class)->dispose(object);
+  G_OBJECT_CLASS(keyboop_engine_parent_class)->finalize(object);
 }
 
 static bool skip_auto(const KeyboopEngine *self) {
@@ -586,14 +554,19 @@ static bool is_manual_hotkey(guint keyval, guint keycode, guint modifiers) {
 
 static gboolean keyboop_process_key_event(IBusEngine *engine, guint keyval,
                                           guint keycode, guint modifiers) {
+  if (keyval == IBUS_KEY_VoidSymbol)
+    return FALSE;
+
   auto *self = reinterpret_cast<KeyboopEngine *>(engine);
+
+  // Allow synthesized BackSpaces/commits to pass through to the target app.
+  // Must be checked BEFORE any side-effectful work (data loading, settings I/O)
+  // because forward_key_event re-enters process_key_event synchronously.
+  if (self->muted)
+    return FALSE;
+
   ensure_data_loaded();
   refresh_user_settings(*self->core);
-
-  // Swallow keys while we synthesize BackSpaces/commits — returning FALSE let
-  // GTK apply the same BackSpace again and wipe the previous word.
-  if (self->muted)
-    return TRUE;
   if (modifiers & IBUS_RELEASE_MASK)
     return FALSE;
 
@@ -858,6 +831,7 @@ static void keyboop_engine_class_init(KeyboopEngineClass *klass) {
   object_class->constructor = keyboop_engine_constructor;
   object_class->constructed = keyboop_engine_constructed;
   object_class->dispose = keyboop_engine_dispose;
+  object_class->finalize = keyboop_engine_finalize;
   object_class->set_property = keyboop_engine_set_property;
   object_class->get_property = keyboop_engine_get_property;
   engine_class->process_key_event = keyboop_process_key_event;

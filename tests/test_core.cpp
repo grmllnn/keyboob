@@ -68,13 +68,31 @@ static void test_keymap() {
     auto run = layout_flip_at(mid, 7);
     CHECK(run.text == "nhb");
     CHECK(Keymap::convert(run.text, true) == "три");
-    // caret at end of mono Cyrillic phrase → whole phrase (reverse works)
+    // caret at end of mono Cyrillic phrase → whole phrase
     auto all = layout_flip_at("раз два", 7);
     CHECK(all.text == "раз два");
     CHECK(Keymap::convert(all.text, false) == "hfp ldf");
-    // comma is the US key for «б» — must stay inside the latin run
-    const std::string phrase = "проверяем эту hf,jnftn yj yt lj rjywf";
-    auto tail = layout_flip_at(phrase, keyboop::utf8_length(phrase));
+    // caret at end of multi-word Latin phrase: "ntcnbv cyjdf" -> "тестим снова"
+    auto multi = layout_flip_at("ntcnbv cyjdf", 12);
+    CHECK(multi.text == "ntcnbv cyjdf");
+    CHECK(Keymap::convert(multi.text, true) == "тестим снова");
+    // mid-phrase insertion: "ок тестим cerf снова"
+    const std::string phrase2 = "ок тестим cerf снова";
+    // caret at start of "cerf" (char offset 10)
+    auto run_start = layout_flip_at(phrase2, 10);
+    CHECK(run_start.text == "cerf");
+    CHECK(run_start.start_cp == 10);
+    CHECK(run_start.end_cp == 14);
+    CHECK(Keymap::convert(run_start.text, true) == "сука");
+    // caret at end of "cerf" (char offset 14)
+    auto run_end = layout_flip_at(phrase2, 14);
+    CHECK(run_end.text == "cerf");
+    CHECK(run_end.start_cp == 10);
+    CHECK(run_end.end_cp == 14);
+    CHECK(Keymap::convert(run_end.text, true) == "сука");
+    // multi-word tail in mixed sentence:
+    const std::string phrase3 = "проверяем эту hf,jnftn yj yt lj rjywf";
+    auto tail = layout_flip_at(phrase3, keyboop::utf8_length(phrase3));
     CHECK(tail.text == "hf,jnftn yj yt lj rjywf");
     CHECK(Keymap::convert(tail.text, true) == "работает но не до конца");
   }
@@ -138,10 +156,21 @@ static void test_detector() {
   d = LayoutDetector::decide("lf", exc);
   CHECK(d == SwapDecision::convert(true)); // → да
 
-  // ignored exception
-  exc.add_ignored("ghbdtn");
-  d = LayoutDetector::decide("ghbdtn", exc);
-  CHECK(d.is_keep());
+  // Trailing punctuation tests (must not flip real English/Russian words)
+  CHECK(LayoutDetector::decide("hello,", exc).is_keep());
+  CHECK(LayoutDetector::decide("world.", exc).is_keep());
+  CHECK(LayoutDetector::decide("test!", exc).is_keep());
+  CHECK(LayoutDetector::decide("code;", exc).is_keep());
+  CHECK(LayoutDetector::decide("item:", exc).is_keep());
+  CHECK(LayoutDetector::decide("value?", exc).is_keep());
+  CHECK(LayoutDetector::decide("привет,", exc).is_keep());
+  CHECK(LayoutDetector::decide("мир.", exc).is_keep());
+  CHECK(LayoutDetector::decide("ghbdtn,", exc) == SwapDecision::convert(true));
+  CHECK(LayoutDetector::decide("ghbdtn.", exc) == SwapDecision::convert(true));
+  CHECK(LayoutDetector::decide("hf,jnftn", exc) == SwapDecision::convert(true));
+  CHECK(LayoutDetector::decide("uhb,", exc) == SwapDecision::convert(true));
+  CHECK(LayoutDetector::decide("to`", exc) == SwapDecision::convert(true)); // to` -> ещё
+  CHECK(LayoutDetector::decide("hfp", exc) == SwapDecision::convert(true)); // hfp -> раз
 }
 
 static void test_engine_boundary_pending() {
@@ -273,20 +302,33 @@ static void test_xkb_pair_us_ru() {
   ActiveKeymap::shared().use_pair(pair);
   CHECK(Keymap::convert("ghbdtn", true) == "привет");
   CHECK(Keymap::convert("привет", false) == "ghbdtn");
-  // restore builtin for later tests that assume it
-  ActiveKeymap::shared().use_builtin_us_ru();
+  CHECK(Keymap::convert("{", true) == "Х");
+  CHECK(Keymap::convert("}", true) == "Ъ");
+  CHECK(Keymap::convert(":", true) == "Ж");
+  CHECK(Keymap::convert("\"", true) == "Э");
+  CHECK(Keymap::convert("<", true) == "Б");
+  CHECK(Keymap::convert(">", true) == "Ю");
+  CHECK(Keymap::convert("?", true) == ",");
+  CHECK(to_lower_utf8("І") == "і");
+  CHECK(to_lower_utf8("Ї") == "ї");
+  CHECK(to_lower_utf8("Є") == "є");
+  CHECK(to_lower_utf8("Ў") == "ў");
 }
 
 static void test_gnome_sources_parse() {
   auto s = parse_gnome_sources_value(
-      "[('xkb', 'us'), ('xkb', 'ru'), ('ibus', 'keyboop:us')]");
+      "[('xkb', 'us(intl)'), ('xkb', 'ru+phonetic'), ('ibus', 'keyboop:us')]");
   CHECK(s.size() == 3);
   CHECK(s[0].kind == InputSource::Kind::Xkb);
-  CHECK(s[0].id == "us");
-  CHECK(s[1].id == "ru");
+  CHECK(s[0].id == "us(intl)");
+  CHECK(s[1].id == "ru+phonetic");
   CHECK(s[2].kind == InputSource::Kind::IBusKeyboop);
   auto layouts = layout_ids_from_sources(s);
   CHECK(layouts.size() == 3);
+  CHECK(layouts[0].layout == "us");
+  CHECK(layouts[0].variant == "intl");
+  CHECK(layouts[1].layout == "ru");
+  CHECK(layouts[1].variant == "phonetic");
   CHECK(keyboop_engine_name(XkbLayoutId::parse("ru+phonetic")) ==
         "keyboop:ru+phonetic");
 }

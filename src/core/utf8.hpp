@@ -162,9 +162,11 @@ inline void utf8_pop_back(std::string &s) {
   if (s.empty())
     return;
   size_t i = s.size();
+  size_t count = 0;
   do {
     --i;
-  } while (i > 0 && (static_cast<unsigned char>(s[i]) & 0xC0) == 0x80);
+    ++count;
+  } while (i > 0 && count < 4 && (static_cast<unsigned char>(s[i]) & 0xC0) == 0x80);
   s.resize(i);
 }
 
@@ -180,9 +182,11 @@ inline uint32_t utf8_back(std::string_view s) {
   if (s.empty())
     return 0;
   size_t i = s.size();
+  size_t count = 0;
   do {
     --i;
-  } while (i > 0 && (static_cast<unsigned char>(s[i]) & 0xC0) == 0x80);
+    ++count;
+  } while (i > 0 && count < 4 && (static_cast<unsigned char>(s[i]) & 0xC0) == 0x80);
   return Utf8Iter(s.substr(i)).next();
 }
 
@@ -293,17 +297,43 @@ inline LayoutFlipAt layout_flip_at(std::string_view phrase, size_t cursor_cp) {
   int want = 0;
   size_t anchor = 0;
   bool found = false;
-  for (size_t i = cursor_cp; i > 0; --i) {
-    int sc = letter_script(cps[i - 1].cp);
+
+  // 1. Priority: check character right under cursor
+  if (cursor_cp < cps.size()) {
+    int sc = letter_script(cps[cursor_cp].cp);
     if (sc) {
       want = sc;
-      anchor = i - 1;
+      anchor = cursor_cp;
       found = true;
-      break;
+    }
+  }
+  // 2. If character under cursor is not a letter, check character before cursor
+  if (!found && cursor_cp > 0) {
+    int sc = letter_script(cps[cursor_cp - 1].cp);
+    if (sc) {
+      want = sc;
+      anchor = cursor_cp - 1;
+      found = true;
+    }
+  }
+  // 3. Fallback: look left then right within non-whitespace
+  if (!found) {
+    for (size_t i = cursor_cp; i > 0; --i) {
+      if (cps[i - 1].cp == ' ' || cps[i - 1].cp == '\t' || cps[i - 1].cp == '\n')
+        break;
+      int sc = letter_script(cps[i - 1].cp);
+      if (sc) {
+        want = sc;
+        anchor = i - 1;
+        found = true;
+        break;
+      }
     }
   }
   if (!found) {
     for (size_t i = cursor_cp; i < cps.size(); ++i) {
+      if (cps[i].cp == ' ' || cps[i].cp == '\t' || cps[i].cp == '\n')
+        break;
       int sc = letter_script(cps[i].cp);
       if (sc) {
         want = sc;
@@ -318,23 +348,57 @@ inline LayoutFlipAt layout_flip_at(std::string_view phrase, size_t cursor_cp) {
 
   size_t lo = anchor;
   size_t hi = anchor + 1;
-  // Glue: spaces AND punctuation/digits (sc==0). Stop only on the other
-  // alphabet — otherwise "hf,jnftn" (б = comma on US) splits the run and
-  // mid-phrase convert silently no-ops unless the user selects.
+
+  // Expanding left: allow spaces only if preceded by the same script (want)
   while (lo > 0) {
-    int sc = letter_script(cps[lo - 1].cp);
+    uint32_t cp = cps[lo - 1].cp;
+    if (cp == '\n' || cp == '\r')
+      break;
+    if (cp == ' ' || cp == '\t') {
+      size_t k = lo - 1;
+      while (k > 0 && (cps[k - 1].cp == ' ' || cps[k - 1].cp == '\t'))
+        --k;
+      if (k > 0) {
+        int sc = letter_script(cps[k - 1].cp);
+        if (sc == want) {
+          lo = k;
+          continue;
+        }
+      }
+      break;
+    }
+    int sc = letter_script(cp);
     if (sc == want || sc == 0)
       --lo;
     else
       break;
   }
+
+  // Expanding right: allow spaces only if followed by the same script (want)
   while (hi < cps.size()) {
-    int sc = letter_script(cps[hi].cp);
+    uint32_t cp = cps[hi].cp;
+    if (cp == '\n' || cp == '\r')
+      break;
+    if (cp == ' ' || cp == '\t') {
+      size_t k = hi + 1;
+      while (k < cps.size() && (cps[k].cp == ' ' || cps[k].cp == '\t'))
+        ++k;
+      if (k < cps.size()) {
+        int sc = letter_script(cps[k].cp);
+        if (sc == want) {
+          hi = k;
+          continue;
+        }
+      }
+      break;
+    }
+    int sc = letter_script(cp);
     if (sc == want || sc == 0)
       ++hi;
     else
       break;
   }
+
   while (lo < hi && (cps[lo].cp == ' ' || cps[lo].cp == '\t'))
     ++lo;
   while (hi > lo && (cps[hi - 1].cp == ' ' || cps[hi - 1].cp == '\t'))

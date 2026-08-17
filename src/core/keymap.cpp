@@ -14,6 +14,11 @@ const std::pair<const char *, const char *> kBasePairs[] = {
     {"m", "ь"}, {",", "б"}, {".", "ю"}, {"/", "."},
 };
 
+const std::pair<const char *, const char *> kShiftedPunctPairs[] = {
+    {"~", "Ё"}, {"{", "Х"}, {"}", "Ъ"}, {":", "Ж"},
+    {"\"", "Э"}, {"<", "Б"}, {">", "Ю"}, {"?", ","},
+};
+
 std::unordered_map<std::string, std::string> build_en_to_ru() {
   std::unordered_map<std::string, std::string> d;
   for (auto [e, r] : kBasePairs) {
@@ -22,6 +27,9 @@ std::unordered_map<std::string, std::string> build_en_to_ru() {
       std::string Eu(1, static_cast<char>(e[0] - 'a' + 'A'));
       d[Eu] = utf8_encode(utf8_to_upper(Utf8Iter(r).next()));
     }
+  }
+  for (auto [e, r] : kShiftedPunctPairs) {
+    d[e] = r;
   }
   return d;
 }
@@ -34,6 +42,9 @@ std::unordered_map<std::string, std::string> build_ru_to_en() {
       std::string Eu(1, static_cast<char>(e[0] - 'a' + 'A'));
       d[utf8_encode(utf8_to_upper(Utf8Iter(r).next()))] = Eu;
     }
+  }
+  for (auto [e, r] : kShiftedPunctPairs) {
+    d[r] = e;
   }
   return d;
 }
@@ -60,7 +71,11 @@ const std::unordered_map<std::string, std::string> &Keymap::ru_to_en() {
 
 bool Keymap::is_trailing_punct(uint32_t cp) {
   return cp == '.' || cp == ',' || cp == '!' || cp == '?' || cp == ';' ||
-         cp == ':' || cp == 0x2026;
+         cp == ':' || cp == 0x2026 || cp == '\'' || cp == '"' ||
+         cp == '(' || cp == ')' || cp == '[' || cp == ']' ||
+         cp == '{' || cp == '}' || cp == '<' || cp == '>' || cp == '/' ||
+         cp == '\\' || cp == '-' || cp == '_' || cp == 0x00AB || cp == 0x00BB ||
+         cp == 0x201C || cp == 0x201D || cp == 0x2018 || cp == 0x2019;
 }
 
 std::string Keymap::convert(std::string_view text, bool to_cyrillic) {

@@ -156,14 +156,18 @@ SwapDecision LayoutDetector::live_decide(std::string_view raw) {
   if (swapped == w || !all_letters(swapped))
     return SwapDecision::keep();
   auto &data = LayoutData::shared();
-  if (source_lat && data.has_word_en(w))
+  std::string w_clean = Keymap::core(w);
+  std::string swapped_clean = Keymap::core(swapped);
+  if (source_lat && (data.has_word_en(w) || (!w_clean.empty() && data.has_word_en(w_clean))))
     return SwapDecision::keep();
-  if (!source_lat && data.has_word_ru(w))
+  if (!source_lat && (data.has_word_ru(w) || (!w_clean.empty() && data.has_word_ru(w_clean))))
     return SwapDecision::keep();
-  if (is_exception_or_prefix(w, source_cyr))
+  if (is_exception_or_prefix(w, source_cyr) || (!w_clean.empty() && is_exception_or_prefix(w_clean, source_cyr)))
     return SwapDecision::keep();
-  double orig = data.plausibility(w, source_cyr);
-  double swap = data.plausibility(swapped, to_cyr);
+  std::string eval_orig = w_clean.empty() ? w : w_clean;
+  std::string eval_swap = swapped_clean.empty() ? swapped : swapped_clean;
+  double orig = data.plausibility(eval_orig, source_cyr);
+  double swap = data.plausibility(eval_swap, to_cyr);
   if (orig <= live_impossible && swap > orig + live_margin)
     return SwapDecision::convert(to_cyr);
   return SwapDecision::keep();
@@ -178,10 +182,15 @@ SwapDecision LayoutDetector::mixed_rescue(std::string_view raw) {
   auto to_ru = Keymap::convert(core, true);
   auto to_en = Keymap::convert(core, false);
   auto &data = LayoutData::shared();
+  auto to_ru_clean = to_lower_utf8(Keymap::core(to_ru));
+  auto to_en_clean = to_lower_utf8(Keymap::core(to_en));
   bool ru_ok = !has_latin_letter(to_ru) &&
-               data.has_word_ru(to_lower_utf8(to_ru));
+               (data.has_word_ru(to_lower_utf8(to_ru)) ||
+                (!to_ru_clean.empty() && data.has_word_ru(to_ru_clean)));
   bool en_ok =
-      !has_cyrillic(to_en) && data.has_word_en(to_lower_utf8(to_en));
+      !has_cyrillic(to_en) &&
+      (data.has_word_en(to_lower_utf8(to_en)) ||
+       (!to_en_clean.empty() && data.has_word_en(to_en_clean)));
   if (ru_ok && !en_ok)
     return SwapDecision::convert(true);
   if (en_ok && !ru_ok)
@@ -230,8 +239,13 @@ SwapDecision LayoutDetector::decide(std::string_view raw,
   size_t min_len = had_digits ? 4 : 1;
   if (wlen < min_len || !all_layout_letters(w))
     return SwapDecision::keep();
+
+  std::string w_clean = Keymap::core(w);
   if (exceptions.ignored().count(w) || exceptions.learned().count(w) ||
-      ExtraWords::default_keep().count(w))
+      ExtraWords::default_keep().count(w) ||
+      (!w_clean.empty() && (exceptions.ignored().count(w_clean) ||
+                            exceptions.learned().count(w_clean) ||
+                            ExtraWords::default_keep().count(w_clean))))
     return SwapDecision::keep();
 
   bool source_cyr = has_cyrillic(w);
@@ -241,21 +255,28 @@ SwapDecision LayoutDetector::decide(std::string_view raw,
 
   bool to_cyr = !source_cyr;
   auto swapped = to_lower_utf8(Keymap::convert(core, to_cyr));
-  if (swapped == w || !all_letters_or_apos(swapped))
+  std::string swapped_clean = Keymap::core(swapped);
+  if (swapped == w || (!all_letters_or_apos(swapped) &&
+                       (swapped_clean.empty() || !all_letters_or_apos(swapped_clean))))
     return SwapDecision::keep();
 
   auto &data = LayoutData::shared();
   bool source_is_real =
-      data.has_word_ru(w) || data.has_word_en(w);
+      data.has_word_ru(w) || data.has_word_en(w) ||
+      (!w_clean.empty() && (data.has_word_ru(w_clean) || data.has_word_en(w_clean)));
+  bool swapped_is_real =
+      data.has_word_ru(swapped) || data.has_word_en(swapped) ||
+      (!swapped_clean.empty() && (data.has_word_ru(swapped_clean) || data.has_word_en(swapped_clean)));
 
-  if (force_swap().count(swapped) && !source_is_real)
+  if ((force_swap().count(swapped) || force_swap().count(swapped_clean)) && !source_is_real)
     return SwapDecision::convert(to_cyr);
-  if (exceptions.force_swap().count(swapped))
+  if (exceptions.force_swap().count(swapped) || exceptions.force_swap().count(swapped_clean))
     return SwapDecision::convert(to_cyr);
-  if (force_swap().count(w) || exceptions.force_swap().count(w))
+  if (force_swap().count(w) || force_swap().count(w_clean) ||
+      exceptions.force_swap().count(w) || exceptions.force_swap().count(w_clean))
     return SwapDecision::keep();
 
-  if (wlen >= 2 && source_is_real &&
+  if (wlen >= 2 && source_is_real && !swapped_is_real &&
       !(source_lat && ExtraWords::force_ru_amb().count(w)))
     return SwapDecision::keep();
 
@@ -282,38 +303,50 @@ SwapDecision LayoutDetector::decide(std::string_view raw,
 
   auto en_swap_not_junk = [&] {
     return wlen >= 4 ||
-           data.plausibility(swapped, false) > short_en_swap_floor;
+           data.plausibility(swapped_clean.empty() ? swapped : swapped_clean, false) > short_en_swap_floor;
   };
 
   if (source_lat) {
-    if (data.has_word_en(w) && !ExtraWords::force_ru_amb().count(w)) {
-      if (context == ContextHint::Cyrillic && data.has_word_ru(swapped) &&
-          !ExtraWords::en_keep_short().count(w))
+    if (data.has_word_ru(swapped) && !data.has_word_en(w))
+      return SwapDecision::convert(true);
+
+    if ((data.has_word_en(w) || (!w_clean.empty() && data.has_word_en(w_clean))) &&
+        !ExtraWords::force_ru_amb().count(w) && !ExtraWords::force_ru_amb().count(w_clean)) {
+      if (context == ContextHint::Cyrillic &&
+          (data.has_word_ru(swapped) || (!swapped_clean.empty() && data.has_word_ru(swapped_clean))) &&
+          !ExtraWords::en_keep_short().count(w) && !ExtraWords::en_keep_short().count(w_clean))
         return SwapDecision::convert(true);
       return SwapDecision::keep();
     }
-    if (data.has_word_ru(swapped)) {
+    if (data.has_word_ru(swapped) || (!swapped_clean.empty() && data.has_word_ru(swapped_clean))) {
       if (context == ContextHint::Latin &&
-          ExtraWords::en_keep_short().count(w))
+          (ExtraWords::en_keep_short().count(w) || (!w_clean.empty() && ExtraWords::en_keep_short().count(w_clean))))
         return SwapDecision::keep();
       return SwapDecision::convert(true);
     }
   } else {
-    if (ExtraWords::force_en_amb().count(swapped) && !data.has_word_ru(w))
+    if (data.has_word_en(swapped) && !data.has_word_ru(w) && en_swap_not_junk())
       return SwapDecision::convert(false);
-    if (data.has_word_ru(w)) {
-      if (context == ContextHint::Latin && data.has_word_en(swapped))
+
+    if ((ExtraWords::force_en_amb().count(swapped) || (!swapped_clean.empty() && ExtraWords::force_en_amb().count(swapped_clean))) &&
+        !data.has_word_ru(w) && (w_clean.empty() || !data.has_word_ru(w_clean)))
+      return SwapDecision::convert(false);
+    if (data.has_word_ru(w) || (!w_clean.empty() && data.has_word_ru(w_clean))) {
+      if (context == ContextHint::Latin &&
+          (data.has_word_en(swapped) || (!swapped_clean.empty() && data.has_word_en(swapped_clean))))
         return SwapDecision::convert(false);
       return SwapDecision::keep();
     }
-    if (data.has_word_en(swapped) && en_swap_not_junk())
+    if ((data.has_word_en(swapped) || (!swapped_clean.empty() && data.has_word_en(swapped_clean))) && en_swap_not_junk())
       return SwapDecision::convert(false);
   }
 
-  if (wlen < 4)
+  std::string eval_orig = w_clean.empty() ? w : w_clean;
+  std::string eval_swap = swapped_clean.empty() ? swapped : swapped_clean;
+  if (utf8_cp_count(eval_orig) < 4)
     return SwapDecision::keep();
-  double orig_score = data.plausibility(w, source_cyr);
-  double swap_score = data.plausibility(swapped, to_cyr);
+  double orig_score = data.plausibility(eval_orig, source_cyr);
+  double swap_score = data.plausibility(eval_swap, to_cyr);
   if (swap_score > orig_score + margin)
     return SwapDecision::convert(to_cyr);
   if (orig_score <= -19.0 && swap_score > orig_score + 1.0)

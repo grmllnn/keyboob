@@ -1,6 +1,16 @@
 import Gio from 'gi://Gio';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
-import {getInputSourceManager} from 'resource:///org/gnome/shell/ui/status/keyboard.js';
+
+let getInputSourceManager;
+try {
+  ({getInputSourceManager} = await import('resource:///org/gnome/shell/ui/status/keyboard.js'));
+} catch (e1) {
+  try {
+    ({getInputSourceManager} = await import('resource:///org/gnome/shell/ui/keyboard.js'));
+  } catch (e2) {
+    console.error('KeyboopSwitch: failed to import getInputSourceManager', e2);
+  }
+}
 
 const IFACE = `
 <node>
@@ -15,12 +25,14 @@ const IFACE = `
 
 class KeyboopSwitchDBus {
   Activate(id) {
+    if (!getInputSourceManager)
+      return [false, 'getInputSourceManager unavailable'];
     const sources = getInputSourceManager().inputSources;
     for (const k in sources) {
       if (!Object.prototype.hasOwnProperty.call(sources, k))
         continue;
       const src = sources[k];
-      if (src.id === id) {
+      if (src.id === id || `${src.type}:${src.id}` === id) {
         src.activate();
         return [true, `${src.type}:${src.id}`];
       }
