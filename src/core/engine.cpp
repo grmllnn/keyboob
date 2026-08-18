@@ -33,9 +33,8 @@ void Engine::soft_context_reset() {
 }
 
 std::optional<ReplaceAction>
-Engine::apply_decision(const std::string &word, int delete_count,
-                       const std::string &tail, SwapDecision d, bool is_auto,
-                       bool completed_only) {
+Engine::apply_decision(const std::string &word, const std::string &tail,
+                       SwapDecision d, bool is_auto, bool completed_only) {
   if (d.is_keep())
     return std::nullopt;
   auto converted =
@@ -51,7 +50,6 @@ Engine::apply_decision(const std::string &word, int delete_count,
     buffer_.clear();
     return std::nullopt;
   }
-  std::string insert = converted + tail;
   if (completed_only)
     buffer_.apply_completed_conversion(converted);
   else
@@ -59,45 +57,34 @@ Engine::apply_decision(const std::string &word, int delete_count,
 
   last_original_ = word;
   last_converted_ = converted;
-  last_delete_count_ = delete_count;
   last_tail_ = tail;
-  last_to_cyr_ = d.to_cyrillic;
   if (is_auto)
     undo_.notice_auto_conversion(word, converted);
 
-  return ReplaceAction{delete_count, insert, d.to_cyrillic, true};
+  return ReplaceAction{word + tail, converted + tail, d.to_cyrillic};
 }
 
 std::optional<ReplaceAction>
 Engine::on_boundary(std::string_view whitespace, bool completed_only) {
-  // Snippet before boundary convert
+  (void)completed_only;
   if (!buffer_.current_word().empty()) {
     if (auto exp = snip_.expansion_for_typed(buffer_.current_word())) {
-      int del = static_cast<int>(utf8_length(buffer_.current_word()));
+      std::string trigger = buffer_.current_word();
       buffer_.commit_snippet(*exp, std::string(whitespace));
-      return ReplaceAction{del, *exp + std::string(whitespace), false, false};
+      return ReplaceAction{std::move(trigger), *exp, false};
     }
   }
 
-  // Take current word before boundary moves it
   std::string word;
-  int delete_count = 0;
-  if (!buffer_.current_word().empty()) {
+  if (!buffer_.current_word().empty())
     word = buffer_.current_word();
-    delete_count = static_cast<int>(utf8_length(word));
-  }
+  else
+    return std::nullopt;
 
-  // Mixed rescue on current word
-  if (!word.empty()) {
-    auto mixed = LayoutDetector::mixed_rescue(word);
-    if (!mixed.is_keep() && settings_.auto_enabled && settings_.enabled) {
-      buffer_.boundary(whitespace);
-      // delete_count includes whitespace: callers that swallow the boundary key
-      // in PreInputMethod must subtract utf8_length(whitespace) before replace.
-      return apply_decision(
-          word, delete_count + static_cast<int>(utf8_length(whitespace)),
-          std::string(whitespace), mixed, true, true);
-    }
+  if (auto mixed = LayoutDetector::mixed_rescue(word);
+      !mixed.is_keep() && settings_.auto_enabled && settings_.enabled) {
+    buffer_.boundary(whitespace);
+    return apply_decision(word, "", mixed, true, true);
   }
 
   buffer_.boundary(whitespace);
@@ -105,7 +92,6 @@ Engine::on_boundary(std::string_view whitespace, bool completed_only) {
   if (!settings_.enabled || !settings_.auto_enabled)
     return std::nullopt;
 
-  // After boundary, completed word is last_word
   auto done = buffer_.word_for_conversion(true);
   if (!done)
     return std::nullopt;
@@ -115,7 +101,6 @@ Engine::on_boundary(std::string_view whitespace, bool completed_only) {
   if (prev)
     prev_sv = *prev;
 
-  // Prefer mixed rescue on completed word
   auto mixed = LayoutDetector::mixed_rescue(done->word);
   SwapDecision d = mixed.is_keep()
                        ? LayoutDetector::decide(done->word, exc_, prev_sv,
@@ -123,9 +108,7 @@ Engine::on_boundary(std::string_view whitespace, bool completed_only) {
                        : mixed;
   after_caret_jump_ = false;
 
-  // delete_count includes trailing whitespace that was just typed — we re-insert it
-  int del = static_cast<int>(utf8_length(done->word) + utf8_length(done->tail));
-  return apply_decision(done->word, del, done->tail, d, true, true);
+  return apply_decision(done->word, "", d, true, true);
 }
 
 std::optional<ReplaceAction> Engine::manual_convert() {
@@ -143,21 +126,15 @@ std::optional<ReplaceAction> Engine::manual_convert() {
   else if (source_lat && !source_cyr)
     to_cyr = true;
 
-  // U1 undo detection: flipping last auto result back
-  undo_.notice_manual_reflip(wfc->word,
-                             Keymap::convert(wfc->word, to_cyr));
-
-  if (undo_.is_session_protected(wfc->word)) {
-    // still allow manual — user asked explicitly
-  }
+  undo_.notice_manual_reflip(wfc->word, Keymap::convert(wfc->word, to_cyr));
 
   SwapDecision d = SwapDecision::convert(to_cyr);
-  auto act = apply_decision(wfc->word, wfc->delete_count, wfc->tail, d, false,
+  // Tail is already on screen for a completed word; include it so adapters
+  // replace the same span they would delete.
+  auto act = apply_decision(wfc->word, wfc->tail, d, false,
                             buffer_.current_word().empty());
   if (act)
     undo_.protect(last_converted_);
-  // Buffer clear is the IBus layer's job after a successful on-screen replace.
-  // Clearing here while DeleteSurroundingText no-ops caused kloприветghbdtn.
   return act;
 }
 
@@ -174,16 +151,13 @@ std::optional<ReplaceAction> Engine::maybe_live_fix() {
   auto d = LayoutDetector::live_decide(w);
   if (d.is_keep())
     return std::nullopt;
-  int del = static_cast<int>(utf8_length(w));
-  return apply_decision(w, del, "", d, true, false);
+  return apply_decision(w, "", d, true, false);
 }
 
 std::optional<ReplaceAction> Engine::undo_last() {
   if (last_converted_.empty() || last_original_.empty())
     return std::nullopt;
-  // Restore original + tail
-  int del = static_cast<int>(utf8_length(last_converted_) +
-                             utf8_length(last_tail_));
+  std::string expected = last_converted_ + last_tail_;
   std::string insert = last_original_ + last_tail_;
   if (buffer_.current_word().empty())
     buffer_.apply_completed_conversion(last_original_);
@@ -191,7 +165,7 @@ std::optional<ReplaceAction> Engine::undo_last() {
     buffer_.apply_conversion(last_original_);
   last_converted_.clear();
   last_original_.clear();
-  return ReplaceAction{del, insert, false, false};
+  return ReplaceAction{std::move(expected), std::move(insert), false};
 }
 
 } // namespace keyboop

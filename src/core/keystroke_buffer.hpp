@@ -31,7 +31,6 @@ public:
 
   struct WordForConversion {
     std::string word;
-    int delete_count = 0;
     std::string tail;
   };
   std::optional<WordForConversion>
@@ -39,7 +38,6 @@ public:
 
   struct GroupForConversion {
     std::vector<SessionWord> words;
-    int delete_count = 0;
   };
   std::optional<GroupForConversion> group_for_conversion() const;
 

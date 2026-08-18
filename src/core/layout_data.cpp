@@ -2,6 +2,7 @@
 #include "extra_words.hpp"
 #include "utf8.hpp"
 
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -65,6 +66,30 @@ bool LayoutData::load(const std::string &data_dir) {
             << " ru-w=" << words_ru_.size() << " en-w=" << words_en_.size()
             << "\n";
   return loaded_;
+}
+
+std::vector<std::string> layout_data_search_paths() {
+  std::vector<std::string> out;
+  if (const char *e = std::getenv("KEYBOOP_DATA_DIR"); e && e[0])
+    out.emplace_back(e);
+#ifdef KEYBOOP_INSTALL_DATADIR
+  out.emplace_back(KEYBOOP_INSTALL_DATADIR);
+#endif
+#ifdef KEYBOOP_DEFAULT_DATA_DIR
+  out.emplace_back(KEYBOOP_DEFAULT_DATA_DIR);
+#endif
+  return out;
+}
+
+bool LayoutData::load_from_search_path() {
+  if (loaded_)
+    return true;
+  for (const auto &d : layout_data_search_paths()) {
+    std::ifstream probe(d + "/words_en.json");
+    if (probe && load(d))
+      return true;
+  }
+  return false;
 }
 
 double LayoutData::plausibility(std::string_view word, bool cyrillic) const {

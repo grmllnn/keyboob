@@ -35,4 +35,11 @@ XkbPairMaps build_xkb_pair(const XkbLayoutId &latin, const XkbLayoutId &cyrillic
 XkbPairMaps pick_latin_cyrillic_pair(const std::vector<XkbLayoutId> &layouts,
                                      const XkbLayoutId *active = nullptr);
 
+/// Fcitx5 `keyboard-us` / `keyboard-ru-phonetic` → XkbLayoutId.
+XkbLayoutId parse_fcitx_im_name(std::string_view name);
+
+/// Exact IM name for `target` in the current Fcitx group (layout+variant, then layout).
+std::string fcitx_im_for_layout(const std::vector<std::string> &im_names,
+                                const XkbLayoutId &target);
+
 } // namespace keyboop

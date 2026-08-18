@@ -27,11 +27,12 @@ struct Settings {
   int double_tap_timeout_ms = 250;
 };
 
+/// Adapter contract: replace on-screen `expected` with `replacement`.
+/// Boundary keys (Space/Enter/Tab) are NOT included — adapters own those.
 struct ReplaceAction {
-  int delete_count = 0;
-  std::string insert;
+  std::string expected;
+  std::string replacement;
   bool switch_to_cyrillic = false;
-  bool did_switch_layout = false;
 };
 
 class Engine {
@@ -60,7 +61,6 @@ public:
 
 private:
   std::optional<ReplaceAction> apply_decision(const std::string &word,
-                                              int delete_count,
                                               const std::string &tail,
                                               SwapDecision d, bool is_auto,
                                               bool completed_only);
@@ -75,9 +75,7 @@ private:
 
   std::string last_original_;
   std::string last_converted_;
-  int last_delete_count_ = 0;
   std::string last_tail_;
-  bool last_to_cyr_ = false;
 };
 
 } // namespace keyboop

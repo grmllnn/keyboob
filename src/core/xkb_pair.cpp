@@ -207,4 +207,35 @@ XkbPairMaps pick_latin_cyrillic_pair(const std::vector<XkbLayoutId> &layouts,
   return build_xkb_pair(latin, cyr);
 }
 
+XkbLayoutId parse_fcitx_im_name(std::string_view name) {
+  constexpr std::string_view pfx = "keyboard-";
+  if (name.size() <= pfx.size() || name.substr(0, pfx.size()) != pfx)
+    return {};
+  std::string rest(name.substr(pfx.size()));
+  auto dash = rest.find('-');
+  if (dash == std::string::npos)
+    return XkbLayoutId::parse(rest);
+  XkbLayoutId id;
+  id.layout = rest.substr(0, dash);
+  id.variant = rest.substr(dash + 1);
+  return id;
+}
+
+std::string fcitx_im_for_layout(const std::vector<std::string> &im_names,
+                                const XkbLayoutId &target) {
+  if (target.empty())
+    return {};
+  for (const auto &n : im_names) {
+    auto id = parse_fcitx_im_name(n);
+    if (id.layout == target.layout && id.variant == target.variant)
+      return n;
+  }
+  for (const auto &n : im_names) {
+    auto id = parse_fcitx_im_name(n);
+    if (id.layout == target.layout)
+      return n;
+  }
+  return {};
+}
+
 } // namespace keyboop

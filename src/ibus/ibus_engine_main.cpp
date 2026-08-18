@@ -1,5 +1,11 @@
 /*
  * Keyboop IBus engine — one engine per layout (keyboop:us, keyboop:ru, …).
+ * Keys pass through (no IM preedit/underline). Firefox/Qt ignore Latin
+ * preedit or apply the first commit one event late.
+ * Auto-convert on Space/Enter/Tab replaces the tracked word only when
+ * surrounding text matches, else N× Backspace (keycode 0) — the app already
+ * has those characters. Terminal: auto off, same tracking, Ctrl+Alt+K only
+ * if surrounding matches. Never commit-only on top of already-typed text.
  * Modes: --xml | --ibus
  */
 #include "active_keymap.hpp"
@@ -16,21 +22,22 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cctype>
 #include <ctime>
 #include <string>
 #include <sys/stat.h>
 #include <vector>
 
 #ifndef KEYBOOP_LIBEXECDIR
-#define KEYBOOP_LIBEXECDIR "/usr/libexec"
+#error "KEYBOOP_LIBEXECDIR must be set by CMake"
 #endif
 
 namespace {
 
 IBusBus *g_bus = nullptr;
-// Cached GNOME sources fingerprint — avoid gsettings+xkb on every key.
 std::string g_sources_fp;
 time_t g_settings_mtime = -1;
+keyboop::UserSettings g_user_settings;
 
 void refresh_user_settings(keyboop::Engine &eng) {
   auto path = keyboop::user_config_path();
@@ -38,11 +45,15 @@ void refresh_user_settings(keyboop::Engine &eng) {
   time_t mtime = 0;
   if (!path.empty() && stat(path.c_str(), &st) == 0)
     mtime = st.st_mtime;
-  if (mtime == g_settings_mtime && g_settings_mtime != -1)
-    return;
-  g_settings_mtime = mtime;
-  auto us = keyboop::load_user_settings();
-  eng.settings().auto_enabled = us.auto_enabled;
+  // Cache the parsed file, but always copy onto this engine: IBus has one
+  // Engine per layout (keyboop:us, keyboop:ru, …) and a process-wide mtime
+  // skip used to leave the others at auto_enabled=true.
+  if (mtime != g_settings_mtime || g_settings_mtime == -1) {
+    g_settings_mtime = mtime;
+    g_user_settings = keyboop::load_user_settings();
+  }
+  eng.settings().auto_enabled = g_user_settings.auto_enabled;
+  eng.settings().manual_hotkeys = {g_user_settings.hotkey};
 }
 
 void ensure_data_loaded() {
@@ -50,16 +61,7 @@ void ensure_data_loaded() {
   if (once)
     return;
   once = true;
-  auto &data = keyboop::LayoutData::shared();
-  const char *env = std::getenv("KEYBOOP_DATA_DIR");
-  // Prefer installed data over the compile-time source-tree path.
-  if (env && data.load(env))
-    return;
-  if (data.load("/usr/share/keyboop"))
-    return;
-  if (data.load("/usr/local/share/keyboop"))
-    return;
-  data.load(KEYBOOP_DEFAULT_DATA_DIR);
+  keyboop::LayoutData::shared().load_from_search_path();
 }
 
 std::string sources_fingerprint(
@@ -93,34 +95,13 @@ void refresh_active_keymap(const keyboop::XkbLayoutId *active) {
     keyboop::ActiveKeymap::shared().use_builtin_us_ru();
 }
 
-// delete_count from Engine may include pending boundary chars not yet on screen.
-// Snippet actions do NOT include them — only strip when counts match.
-void strip_pending(keyboop::ReplaceAction &act, std::string_view ws,
-                   bool keep_ws_in_insert) {
-  if (ws.empty() || act.insert.size() < ws.size() || !act.insert.ends_with(ws))
-    return;
-  const int n = static_cast<int>(keyboop::utf8_length(ws));
-  const int insert_wo =
-      static_cast<int>(keyboop::utf8_length(act.insert) - n);
-  if (act.delete_count == insert_wo + n)
-    act.delete_count = insert_wo;
-  if (!keep_ws_in_insert)
-    act.insert.resize(act.insert.size() - ws.size());
-}
-
-// One core across keyboop:us / keyboop:ru so Super+Space mid-word keeps buffer.
-keyboop::Engine &shared_core() {
-  static keyboop::Engine core;
-  return core;
-}
-
 typedef struct _KeyboopEngine {
   IBusEngine parent;
   keyboop::Engine *core;
   keyboop::XkbLayoutId *layout;
   gchar *engine_name;
-  std::string *committed; // exact text we commit_text'd for current word
   gboolean muted;
+  gboolean preedit_shown;
   guint purpose;
   guint caps;
 } KeyboopEngine;
@@ -136,55 +117,25 @@ void commit_utf8(IBusEngine *engine, const std::string &ch) {
   ibus_engine_commit_text(engine, t);
 }
 
-void committed_clear(KeyboopEngine *self) {
-  if (self->committed)
-    self->committed->clear();
+void hide_preedit(IBusEngine *engine, KeyboopEngine *self) {
+  ibus_engine_hide_preedit_text(engine);
+  if (self)
+    self->preedit_shown = FALSE;
 }
 
-void committed_add(KeyboopEngine *self, const std::string &ch) {
-  if (self->committed)
-    self->committed->append(ch);
-}
-
-void committed_pop(KeyboopEngine *self) {
-  if (self->committed && !self->committed->empty())
-    keyboop::utf8_pop_back(*self->committed);
-}
-
-std::string utf8_suffix(const std::string &s, int nchars) {
-  if (nchars <= 0)
-    return {};
-  int total = static_cast<int>(keyboop::utf8_length(s));
-  if (nchars >= total)
-    return s;
-  const gchar *p = s.c_str();
-  const gchar *end = p + s.size();
-  const gchar *start =
-      g_utf8_offset_to_pointer(p, static_cast<glong>(total - nchars));
-  if (start < p || start > end)
-    return {};
-  return std::string(start, end);
-}
-
-void utf8_drop_suffix(std::string &s, int nchars) {
-  if (nchars <= 0 || s.empty())
-    return;
-  int total = static_cast<int>(keyboop::utf8_length(s));
-  if (nchars >= total) {
-    s.clear();
-    return;
-  }
-  const gchar *p = s.c_str();
-  const gchar *cut =
-      g_utf8_offset_to_pointer(p, static_cast<glong>(total - nchars));
-  s.resize(static_cast<size_t>(cut - p));
+void drop_composition(IBusEngine *engine, KeyboopEngine *self) {
+  // Pass-through typing: characters are already in the app. Never commit
+  // the buffer here — that stacked text (ghbdtnпривет) in Telegram/Firefox.
+  hide_preedit(engine, self);
+  if (self->core)
+    self->core->clear_context();
 }
 
 std::string utf8_slice_chars(const gchar *txt, guint from, guint to) {
   if (!txt || to <= from)
     return {};
-  // Validate offsets against actual string length to avoid OOB in
-  // g_utf8_offset_to_pointer (which can SIGSEGV Mutter/gnome-shell).
+  if (!g_utf8_validate(txt, -1, nullptr))
+    return {};
   const guint len = static_cast<guint>(g_utf8_strlen(txt, -1));
   if (from >= len || to > len)
     return {};
@@ -209,12 +160,11 @@ std::string keymap_flip(const std::string &phrase) {
   return converted;
 }
 
-std::string read_primary_selection() {
+std::string run_selection_cmd(const char *cmd) {
   gchar *out = nullptr;
   gint status = 0;
   GError *err = nullptr;
-  if (!g_spawn_command_line_sync("wl-paste -n -p", &out, nullptr, &status,
-                                 &err) ||
+  if (!g_spawn_command_line_sync(cmd, &out, nullptr, &status, &err) ||
       status != 0) {
     g_clear_error(&err);
     g_free(out);
@@ -225,6 +175,17 @@ std::string read_primary_selection() {
   while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
     s.pop_back();
   return s;
+}
+
+std::string read_primary_selection() {
+  if (g_getenv("WAYLAND_DISPLAY")) {
+    std::string s = run_selection_cmd("wl-paste -n -p");
+    if (!s.empty())
+      return s;
+  }
+  if (g_getenv("DISPLAY"))
+    return run_selection_cmd("xclip -o -selection primary");
+  return {};
 }
 
 void forward_backspace(IBusEngine *engine) {
@@ -240,10 +201,11 @@ void forward_delete(IBusEngine *engine) {
 }
 
 // ponytail: cap forward_backspace bursts — too many synthetic key events
-// in one go can destabilize Mutter/Wayland.
-static constexpr int kMaxForwardBackspace = 64;
+// in one go can destabilize Mutter/Wayland. 64 was too low: a selected
+// sentence (~77) no-op'd while its halves converted. 256 covers a tweet;
+// longer highlights fall through to commit.
+static constexpr int kMaxForwardBackspace = 256;
 
-// Replace [start,end) when we have reliable surrounding offsets.
 bool replace_char_range(IBusEngine *engine, KeyboopEngine *self, guint cursor,
                         guint start, guint end, const std::string &expect,
                         const std::string &insert) {
@@ -253,18 +215,16 @@ bool replace_char_range(IBusEngine *engine, KeyboopEngine *self, guint cursor,
   if (static_cast<int>(keyboop::utf8_length(expect)) != n)
     return false;
   if (n > kMaxForwardBackspace)
-    return false; // ponytail: refuse absurdly long replacements
+    return false;
 
   self->muted = TRUE;
-  ibus_engine_hide_preedit_text(engine);
+  hide_preedit(engine, self);
 
-  // Erase characters before cursor with Backspace
   if (cursor > start) {
     guint n_before = cursor - start;
     for (guint i = 0; i < n_before; ++i)
       forward_backspace(engine);
   }
-  // Erase characters after cursor with Delete
   if (end > cursor) {
     guint n_after = end - cursor;
     for (guint i = 0; i < n_after; ++i)
@@ -272,91 +232,106 @@ bool replace_char_range(IBusEngine *engine, KeyboopEngine *self, guint cursor,
   }
 
   commit_utf8(engine, insert);
-  committed_clear(self);
-  self->core->clear_context();
   self->muted = FALSE;
   return true;
 }
 
-// Selection: commit directly replaces selection in IM context.
+// Surrounding missing (Firefox, some Qt): keys already reached the app.
+bool replace_typed_suffix(IBusEngine *engine, KeyboopEngine *self,
+                          const std::string &expect,
+                          const std::string &insert) {
+  if (expect.empty() || insert.empty())
+    return false;
+  const int n = static_cast<int>(keyboop::utf8_length(expect));
+  if (n <= 0 || n > kMaxForwardBackspace)
+    return false;
+  self->muted = TRUE;
+  hide_preedit(engine, self);
+  for (int i = 0; i < n; ++i)
+    forward_backspace(engine);
+  commit_utf8(engine, insert);
+  self->muted = FALSE;
+  return true;
+}
+
+bool apply_expected_replace(IBusEngine *engine, KeyboopEngine *self,
+                            const std::string &expected,
+                            const std::string &insert) {
+  if (expected.empty() || insert.empty() || expected == insert)
+    return false;
+  IBusText *st = nullptr;
+  guint cursor = 0, anchor = 0;
+  ibus_engine_get_surrounding_text(engine, &st, &cursor, &anchor);
+  const gchar *txt = (st && ibus_text_get_text(st) &&
+                      ibus_text_get_text(st)[0] != '\0')
+                         ? ibus_text_get_text(st)
+                         : nullptr;
+  if (txt && !g_utf8_validate(txt, -1, nullptr))
+    txt = nullptr;
+  if (txt) {
+    auto span = keyboop::match_expected_at_caret(txt, cursor, expected);
+    if (st)
+      g_object_unref(st);
+    if (span.ok)
+      return replace_char_range(engine, self, cursor,
+                                static_cast<guint>(span.start_cp),
+                                static_cast<guint>(span.end_cp), expected,
+                                insert);
+    // Qt/Firefox surrounding often lags one key. Word is already in the
+    // widget (pass-through) — suffix Backspace still hits the right chars.
+  } else if (st) {
+    g_object_unref(st);
+  }
+  return replace_typed_suffix(engine, self, expected, insert);
+}
+
 bool replace_selected_text(IBusEngine *engine, KeyboopEngine *self,
                            const std::string &selected,
                            const std::string &insert) {
   if (selected.empty() || insert.empty())
     return false;
-
   self->muted = TRUE;
-  ibus_engine_hide_preedit_text(engine);
+  hide_preedit(engine, self);
   commit_utf8(engine, insert);
-  committed_clear(self);
-  self->core->clear_context();
+  if (self->core)
+    self->core->clear_context();
   self->muted = FALSE;
   return true;
 }
 
-// Delete the last `n` committed characters, then commit `insert`.
-// Updates `committed` to reflect the on-screen phrase (keeps earlier words).
-bool replace_committed_suffix(IBusEngine *engine, KeyboopEngine *self, int n,
-                              const std::string &insert) {
-  if (!self->committed || n <= 0)
-    return false;
-  if (n > kMaxForwardBackspace)
-    return false; // ponytail: refuse absurdly long replacements
-  const std::string expect = utf8_suffix(*self->committed, n);
-  if (expect.empty() ||
-      static_cast<int>(keyboop::utf8_length(expect)) != n)
-    return false;
-
-  self->muted = TRUE;
-  ibus_engine_hide_preedit_text(engine);
-
-  for (int i = 0; i < n; ++i)
-    forward_backspace(engine);
-
-  commit_utf8(engine, insert);
-  utf8_drop_suffix(*self->committed, n);
-  self->committed->append(insert);
-  self->muted = FALSE;
-  return true;
-}
-
-void switch_log(const char *msg, const char *extra = nullptr) {
-  (void)msg;
-  (void)extra;
+bool replace_highlighted(IBusEngine *engine, KeyboopEngine *self, guint cursor,
+                         bool have_range, guint start, guint end,
+                         const std::string &expect, const std::string &insert) {
+  if (have_range &&
+      replace_char_range(engine, self, cursor, start, end, expect, insert))
+    return true;
+  // Highlight is still in the app (we have not sent keys). Commit replaces it.
+  // Used when the span is longer than kMaxForwardBackspace or surrounding
+  // cannot place PRIMARY (select-all / truncated IBus text).
+  return replace_selected_text(engine, self, expect, insert);
 }
 
 void maybe_switch_layout(bool to_cyrillic) {
-  // GNOME Wayland: ibus_bus_set_global_engine reports ok but Shell keeps the
-  // panel/xkb on the old source. Real switch = InputSource.activate() via the
-  // keyboop-switch@keyboop extension (D-Bus).
   auto &km = keyboop::ActiveKeymap::shared();
-  const auto &id =
-      to_cyrillic ? km.cyrillic_layout() : km.latin_layout();
-  if (id.empty()) {
-    switch_log("skip empty layout id");
+  const auto &id = to_cyrillic ? km.cyrillic_layout() : km.latin_layout();
+  if (id.empty())
     return;
-  }
   std::string name = keyboop::keyboop_engine_name(id);
   if (g_bus && ibus_bus_is_connected(g_bus)) {
     IBusEngineDesc *cur = ibus_bus_get_global_engine(g_bus);
     if (cur) {
       const gchar *cur_name = ibus_engine_desc_get_name(cur);
       const bool same = cur_name && name == cur_name;
-      if (cur_name)
-        switch_log(same ? "skip same" : "will switch", cur_name);
       g_object_unref(cur);
       if (same)
         return;
     }
   }
-  switch_log("schedule", name.c_str());
   gchar *hold = g_strdup(name.c_str());
   g_timeout_add(
       80,
       [](gpointer data) -> gboolean {
         gchar *engine = static_cast<gchar *>(data);
-        switch_log("timeout fire", engine);
-        // 1) Shell extension — updates panel + IBus together
         gchar *argv[] = {
             const_cast<gchar *>("gdbus"),
             const_cast<gchar *>("call"),
@@ -378,37 +353,27 @@ void maybe_switch_layout(bool to_cyrillic) {
                                                    G_SPAWN_STDOUT_TO_DEV_NULL |
                                                    G_SPAWN_STDERR_TO_DEV_NULL),
                           nullptr, nullptr, &pid, &spawn_err)) {
-          switch_log("shell activate spawned", engine);
           g_child_watch_add(
               pid,
               [](GPid p, gint status, gpointer eng) {
                 g_spawn_close_pid(p);
                 const bool ok = g_spawn_check_wait_status(status, nullptr);
-                switch_log(ok ? "shell activate exit-ok" : "shell activate exit-fail",
-                           static_cast<gchar *>(eng));
-                // Fallback if extension missing / failed: IBus-only (panel may
-                // stay wrong on Wayland — better than nothing).
                 if (!ok && g_bus && ibus_bus_is_connected(g_bus)) {
                   ibus_bus_set_global_engine_async(g_bus,
                                                    static_cast<gchar *>(eng),
                                                    -1, nullptr, nullptr,
                                                    nullptr);
-                  switch_log("fallback set_global_engine",
-                             static_cast<gchar *>(eng));
                 }
                 g_free(eng);
               },
               engine);
           return G_SOURCE_REMOVE;
         }
-        if (spawn_err) {
-          switch_log("shell activate spawn-err", spawn_err->message);
+        if (spawn_err)
           g_error_free(spawn_err);
-        }
         if (g_bus && ibus_bus_is_connected(g_bus)) {
           ibus_bus_set_global_engine_async(g_bus, engine, -1, nullptr, nullptr,
                                            nullptr);
-          switch_log("fallback set_global_engine", engine);
         }
         g_free(engine);
         return G_SOURCE_REMOVE;
@@ -418,23 +383,6 @@ void maybe_switch_layout(bool to_cyrillic) {
 
 bool flip_to_cyrillic(const std::string &phrase) {
   return keyboop::has_latin_letter(phrase) && !keyboop::has_cyrillic(phrase);
-}
-
-bool apply_replace(IBusEngine *engine, KeyboopEngine *self,
-                   const keyboop::ReplaceAction &act,
-                   const std::string &word_suffix) {
-  if (act.insert.empty() && act.delete_count <= 0)
-    return false;
-  if (!self->committed)
-    return false;
-  // Replace only word_suffix at the end of the committed phrase.
-  const int n = static_cast<int>(keyboop::utf8_length(word_suffix));
-  if (n <= 0 || utf8_suffix(*self->committed, n) != word_suffix)
-    return false;
-  if (!replace_committed_suffix(engine, self, n, act.insert))
-    return false;
-  maybe_switch_layout(act.switch_to_cyrillic);
-  return true;
 }
 
 G_DEFINE_TYPE(KeyboopEngine, keyboop_engine, IBUS_TYPE_ENGINE)
@@ -473,28 +421,25 @@ static void keyboop_engine_get_property(GObject *object, guint prop_id,
 
 static GObject *keyboop_engine_constructor(GType type, guint n_params,
                                            GObjectConstructParam *params) {
-  // Ask clients for surrounding text so DeleteSurroundingText can work.
-  gboolean set = FALSE;
   for (guint i = 0; i < n_params; ++i) {
     if (g_strcmp0(params[i].pspec->name, "active-surrounding-text") == 0) {
       g_value_set_boolean(params[i].value, TRUE);
-      set = TRUE;
       break;
     }
   }
-  (void)set;
   return G_OBJECT_CLASS(keyboop_engine_parent_class)
       ->constructor(type, n_params, params);
 }
 
 static void keyboop_engine_init(KeyboopEngine *self) {
-  self->core = &shared_core();
+  self->core = new keyboop::Engine();
   self->layout = new keyboop::XkbLayoutId();
   self->engine_name = nullptr;
-  self->committed = new std::string();
   self->muted = FALSE;
+  self->preedit_shown = FALSE;
   self->purpose = IBUS_INPUT_PURPOSE_FREE_FORM;
   self->caps = 0;
+  refresh_user_settings(*self->core);
 }
 
 static void keyboop_engine_constructed(GObject *object) {
@@ -510,46 +455,237 @@ static void keyboop_engine_constructed(GObject *object) {
 
 static void keyboop_engine_dispose(GObject *object) {
   auto *self = reinterpret_cast<KeyboopEngine *>(object);
-  self->core = nullptr; // shared
   g_clear_pointer(&self->engine_name, g_free);
   G_OBJECT_CLASS(keyboop_engine_parent_class)->dispose(object);
 }
 
 static void keyboop_engine_finalize(GObject *object) {
   auto *self = reinterpret_cast<KeyboopEngine *>(object);
+  delete self->core;
+  self->core = nullptr;
   delete self->layout;
   self->layout = nullptr;
-  delete self->committed;
-  self->committed = nullptr;
   G_OBJECT_CLASS(keyboop_engine_parent_class)->finalize(object);
 }
 
-static bool skip_auto(const KeyboopEngine *self) {
+static bool is_password(const KeyboopEngine *self) {
   return self->purpose == IBUS_INPUT_PURPOSE_PASSWORD ||
-         self->purpose == IBUS_INPUT_PURPOSE_PIN ||
-         self->purpose == IBUS_INPUT_PURPOSE_TERMINAL;
+         self->purpose == IBUS_INPUT_PURPOSE_PIN;
+}
+
+static bool skip_auto(const KeyboopEngine *self) {
+  return is_password(self) || self->purpose == IBUS_INPUT_PURPOSE_TERMINAL;
 }
 
 static bool is_manual_hotkey(guint keyval, guint keycode, guint modifiers) {
-  // Ignore Lock/NumLock noise.
+  (void)keycode;
+  keyboop::HotkeySpec spec;
+  if (!keyboop::parse_hotkey(g_user_settings.hotkey, &spec) || !spec.ok())
+    keyboop::parse_hotkey("Control+Alt+k", &spec);
   const guint mods =
       modifiers & (IBUS_CONTROL_MASK | IBUS_MOD1_MASK | IBUS_META_MASK |
-                   IBUS_SHIFT_MASK | IBUS_SUPER_MASK | IBUS_HYPER_MASK);
+                   IBUS_SHIFT_MASK | IBUS_SUPER_MASK | IBUS_HYPER_MASK |
+                   IBUS_MOD4_MASK);
   const bool ctrl = (mods & IBUS_CONTROL_MASK) != 0;
   const bool alt =
       (mods & IBUS_MOD1_MASK) != 0 || (mods & IBUS_META_MASK) != 0;
-  if (!ctrl || !alt)
+  const bool shift = (mods & IBUS_SHIFT_MASK) != 0;
+  const bool super =
+      (mods & IBUS_SUPER_MASK) != 0 || (mods & IBUS_MOD4_MASK) != 0 ||
+      (mods & IBUS_HYPER_MASK) != 0;
+  if (ctrl != spec.ctrl || alt != spec.alt || shift != spec.shift ||
+      super != spec.super)
     return false;
-  if (mods & (IBUS_SHIFT_MASK | IBUS_SUPER_MASK | IBUS_HYPER_MASK))
+
+  guint want = ibus_keyval_from_name(spec.key.c_str());
+  if (!want && spec.key.size() > 1) {
+    std::string titled = spec.key;
+    titled[0] = static_cast<char>(
+        std::toupper(static_cast<unsigned char>(titled[0])));
+    want = ibus_keyval_from_name(titled.c_str());
+  }
+  if (want && (keyval == want || keyval == ibus_keyval_to_upper(want) ||
+               keyval == ibus_keyval_to_lower(want)))
+    return true;
+
+  gunichar uc = ibus_keyval_to_unicode(keyval);
+  if (!uc)
     return false;
-  // On RU layout the same physical key yields Cyrillic_el, not 'k'.
-  if (keyval == IBUS_KEY_k || keyval == IBUS_KEY_K ||
-      keyval == IBUS_KEY_Cyrillic_el || keyval == IBUS_KEY_Cyrillic_EL)
+  char buf[8]{};
+  gint n = g_unichar_to_utf8(uc, buf);
+  if (n <= 0)
+    return false;
+  std::string ch(buf, static_cast<size_t>(n));
+  auto lat = keyboop::to_lower_utf8(keyboop::Keymap::convert(ch, false));
+  return lat == spec.key;
+}
+
+static bool is_dead_or_compose(guint keyval) {
+  if (keyval == IBUS_KEY_Multi_key)
     return true;
-  // Evdev KEY_K=37 → XKB keycode 45 (fallback if keyval is weird).
-  if (keycode == 45)
+  return keyval >= IBUS_KEY_dead_grave && keyval <= IBUS_KEY_dead_greek;
+}
+
+static bool is_modifier_key(guint keyval) {
+  switch (keyval) {
+  case IBUS_KEY_Shift_L:
+  case IBUS_KEY_Shift_R:
+  case IBUS_KEY_Control_L:
+  case IBUS_KEY_Control_R:
+  case IBUS_KEY_Alt_L:
+  case IBUS_KEY_Alt_R:
+  case IBUS_KEY_Meta_L:
+  case IBUS_KEY_Meta_R:
+  case IBUS_KEY_Super_L:
+  case IBUS_KEY_Super_R:
+  case IBUS_KEY_Hyper_L:
+  case IBUS_KEY_Hyper_R:
+  case IBUS_KEY_Caps_Lock:
+  case IBUS_KEY_Num_Lock:
+  case IBUS_KEY_Scroll_Lock:
+  case IBUS_KEY_ISO_Level3_Shift:
+  case IBUS_KEY_ISO_Level5_Shift:
+  case IBUS_KEY_Mode_switch:
     return true;
-  return false;
+  default:
+    return false;
+  }
+}
+
+static bool is_nav_key(guint keyval) {
+  return keyval == IBUS_KEY_Escape || keyval == IBUS_KEY_Left ||
+         keyval == IBUS_KEY_Right || keyval == IBUS_KEY_Up ||
+         keyval == IBUS_KEY_Down || keyval == IBUS_KEY_Home ||
+         keyval == IBUS_KEY_End || keyval == IBUS_KEY_Page_Up ||
+         keyval == IBUS_KEY_Page_Down || keyval == IBUS_KEY_Delete;
+}
+
+static void handle_manual(IBusEngine *engine, KeyboopEngine *self) {
+  if (is_password(self))
+    return;
+  refresh_active_keymap(self->layout);
+  hide_preedit(engine, self);
+
+  IBusText *st = nullptr;
+  guint cursor = 0, anchor = 0;
+  ibus_engine_get_surrounding_text(engine, &st, &cursor, &anchor);
+  const gchar *txt = (st && ibus_text_get_text(st) &&
+                      ibus_text_get_text(st)[0] != '\0')
+                         ? ibus_text_get_text(st)
+                         : nullptr;
+  if (txt && !g_utf8_validate(txt, -1, nullptr))
+    txt = nullptr;
+
+  const std::string primary = read_primary_selection();
+  std::string selected;
+  guint sel_lo = 0, sel_hi = 0;
+  bool have_range = false;
+  const bool ibus_sel = txt && cursor != anchor;
+
+  if (ibus_sel) {
+    sel_lo = cursor < anchor ? cursor : anchor;
+    sel_hi = cursor < anchor ? anchor : cursor;
+    selected = utf8_slice_chars(txt, sel_lo, sel_hi);
+    if (!selected.empty() && keyboop::utf8_valid(selected))
+      have_range = true;
+    else
+      selected.clear();
+  }
+  if (!have_range && txt && !primary.empty() && keyboop::utf8_valid(primary)) {
+    auto match = keyboop::match_primary_snapshot(txt, cursor, primary);
+    if (match.ok) {
+      selected = primary;
+      sel_lo = static_cast<guint>(match.start_cp);
+      sel_hi = static_cast<guint>(match.end_cp);
+      have_range = true;
+    }
+  }
+  // Select-all: surrounding (or the IBus slice) is only a prefix of PRIMARY.
+  // Backspacing the visible part would leave the rest of the highlight;
+  // commit over the app selection instead. Never layout_flip_at the first word.
+  if (!primary.empty() && keyboop::utf8_valid(primary)) {
+    const std::string visible = selected.empty() && txt ? std::string(txt)
+                                                        : selected;
+    const bool truncated = !visible.empty() &&
+                           keyboop::primary_extends_truncated_selection(
+                               visible, cursor, primary);
+    if (truncated || (ibus_sel && selected.empty())) {
+      selected = primary;
+      have_range = false;
+    }
+  }
+
+  if (!selected.empty()) {
+    std::string converted = keymap_flip(selected);
+    const bool to_cyr = flip_to_cyrillic(selected);
+    if (st)
+      g_object_unref(st);
+    if (!converted.empty() &&
+        replace_highlighted(engine, self, cursor, have_range, sel_lo, sel_hi,
+                            selected, converted))
+      maybe_switch_layout(to_cyr);
+    return;
+  }
+
+  if (self->core && !self->core->buffer().current_word().empty()) {
+    const std::string word = self->core->buffer().current_word();
+    if (txt) {
+      auto span = keyboop::match_span_touching_caret(txt, cursor, word);
+      if (span.ok) {
+        if (auto act = self->core->manual_convert()) {
+          if (st)
+            g_object_unref(st);
+          if (apply_expected_replace(engine, self, word, act->replacement)) {
+            maybe_switch_layout(act->switch_to_cyrillic);
+            self->core->clear_context();
+          }
+          return;
+        }
+      }
+    } else if (auto act = self->core->manual_convert()) {
+      if (st)
+        g_object_unref(st);
+      if (apply_expected_replace(engine, self, word, act->replacement)) {
+        maybe_switch_layout(act->switch_to_cyrillic);
+        self->core->clear_context();
+      }
+      return;
+    }
+  }
+
+  if (txt) {
+    auto run = keyboop::layout_flip_at(txt, cursor);
+    if (!run.text.empty() && keyboop::utf8_valid(run.text)) {
+      std::string converted = keymap_flip(run.text);
+      if (!converted.empty()) {
+        const bool to_cyr = flip_to_cyrillic(run.text);
+        replace_char_range(engine, self, cursor,
+                           static_cast<guint>(run.start_cp),
+                           static_cast<guint>(run.end_cp), run.text,
+                           converted);
+        maybe_switch_layout(to_cyr);
+        if (self->core)
+          self->core->clear_context();
+      }
+    }
+  }
+  if (st)
+    g_object_unref(st);
+}
+
+static gboolean commit_boundary(IBusEngine *engine, KeyboopEngine *self,
+                                std::string_view ws) {
+  const std::string word = self->core->buffer().current_word();
+  if (word.empty())
+    return FALSE;
+  hide_preedit(engine, self);
+  if (auto act = self->core->on_boundary(ws)) {
+    const std::string &expect =
+        act->expected == word ? act->expected : word;
+    if (apply_expected_replace(engine, self, expect, act->replacement))
+      maybe_switch_layout(act->switch_to_cyrillic);
+  }
+  return FALSE; // let Space/Enter/Tab through; word is already on screen
 }
 
 static gboolean keyboop_process_key_event(IBusEngine *engine, guint keyval,
@@ -558,10 +694,6 @@ static gboolean keyboop_process_key_event(IBusEngine *engine, guint keyval,
     return FALSE;
 
   auto *self = reinterpret_cast<KeyboopEngine *>(engine);
-
-  // Allow synthesized BackSpaces/commits to pass through to the target app.
-  // Must be checked BEFORE any side-effectful work (data loading, settings I/O)
-  // because forward_key_event re-enters process_key_event synchronously.
   if (self->muted)
     return FALSE;
 
@@ -570,223 +702,66 @@ static gboolean keyboop_process_key_event(IBusEngine *engine, guint keyval,
   if (modifiers & IBUS_RELEASE_MASK)
     return FALSE;
 
-  // Super+Space etc. arrive with MOD4, not only SUPER — never eat those.
+  if (is_manual_hotkey(keyval, keycode, modifiers)) {
+    handle_manual(engine, self);
+    return TRUE;
+  }
+
   if (modifiers & (IBUS_SUPER_MASK | IBUS_MOD4_MASK | IBUS_HYPER_MASK))
     return FALSE;
 
-  if (is_manual_hotkey(keyval, keycode, modifiers)) {
-    if (skip_auto(self))
-      return TRUE;
-    refresh_active_keymap(self->layout);
-
-    IBusText *st = nullptr;
-    guint cursor = 0, anchor = 0;
-    ibus_engine_get_surrounding_text(engine, &st, &cursor, &anchor);
-    const gchar *txt = (st && ibus_text_get_text(st) &&
-                        ibus_text_get_text(st)[0] != '\0')
-                           ? ibus_text_get_text(st)
-                           : nullptr;
-
-    // --- Selection (IBus range, or PRIMARY that sits at the caret) ---
-    std::string selected;
-    guint sel_lo = 0, sel_hi = 0;
-    bool have_sel_range = false;
-    if (txt && cursor != anchor) {
-      sel_lo = cursor < anchor ? cursor : anchor;
-      sel_hi = cursor < anchor ? anchor : cursor;
-      selected = utf8_slice_chars(txt, sel_lo, sel_hi);
-      have_sel_range = !selected.empty();
-    } else if (txt) {
-      // Wayland: selection often not in cursor/anchor — PRIMARY still is.
-      std::string primary = read_primary_selection();
-      if (!primary.empty()) {
-        const int pn = static_cast<int>(keyboop::utf8_length(primary));
-        if (pn > 0 && cursor >= static_cast<guint>(pn) &&
-            utf8_slice_chars(txt, cursor - static_cast<guint>(pn), cursor) ==
-                primary) {
-          selected = primary;
-          sel_lo = cursor - static_cast<guint>(pn);
-          sel_hi = cursor;
-          have_sel_range = true;
-        } else {
-          // Highlight in the middle: PRIMARY equals some run near caret.
-          auto run = keyboop::layout_flip_at(txt, cursor);
-          if (!run.text.empty() && run.text == primary) {
-            selected = primary;
-            sel_lo = static_cast<guint>(run.start_cp);
-            sel_hi = static_cast<guint>(run.end_cp);
-            have_sel_range = true;
-          }
-          // Else: ignore stale PRIMARY — do not BackSpace blindly.
-        }
-      }
-    }
-
-    if (!selected.empty()) {
-      std::string converted = keymap_flip(selected);
-      const bool to_cyr = flip_to_cyrillic(selected);
-      if (st)
-        g_object_unref(st);
-      if (!converted.empty() &&
-          replace_selected_text(engine, self, selected, converted))
-        maybe_switch_layout(to_cyr);
-      return TRUE;
-    }
-
-    // --- No selection: same-script run at caret ---
-    if (txt) {
-      auto run = keyboop::layout_flip_at(txt, cursor);
-      if (!run.text.empty()) {
-        std::string converted = keymap_flip(run.text);
-        if (!converted.empty()) {
-          const bool to_cyr = flip_to_cyrillic(run.text);
-          bool ok = false;
-          if (run.end_cp == cursor && self->committed &&
-              utf8_suffix(*self->committed,
-                          static_cast<int>(keyboop::utf8_length(run.text))) ==
-                  run.text) {
-            ok = replace_committed_suffix(
-                engine, self,
-                static_cast<int>(keyboop::utf8_length(run.text)), converted);
-            if (ok)
-              self->core->clear_context();
-          }
-          if (!ok)
-            ok = replace_char_range(engine, self, cursor,
-                                    static_cast<guint>(run.start_cp),
-                                    static_cast<guint>(run.end_cp), run.text,
-                                    converted);
-          if (ok)
-            maybe_switch_layout(to_cyr);
-          if (st)
-            g_object_unref(st);
-          // Even on failure: do not fall through to committed tip — that is
-          // what scrambled mid-phrase / selection retries.
-          return TRUE;
-        }
-      }
-    }
-    if (st)
-      g_object_unref(st);
-
-    // --- Fallback: committed tip ---
-    if (!self->committed || self->committed->empty())
-      return TRUE;
-    const std::string phrase =
-        keyboop::layout_flip_suffix(*self->committed);
-    std::string converted = keymap_flip(phrase);
-    if (converted.empty())
-      return TRUE;
-    const bool to_cyr = flip_to_cyrillic(phrase);
-    const int n = static_cast<int>(keyboop::utf8_length(phrase));
-    if (replace_committed_suffix(engine, self, n, converted)) {
-      self->core->clear_context();
-      maybe_switch_layout(to_cyr);
-    }
-    return TRUE;
+  if (modifiers & (IBUS_CONTROL_MASK | IBUS_MOD1_MASK | IBUS_META_MASK)) {
+    if (!(modifiers & IBUS_SHIFT_MASK))
+      drop_composition(engine, self);
+    return FALSE;
   }
 
-  if (modifiers & (IBUS_CONTROL_MASK | IBUS_MOD1_MASK | IBUS_META_MASK))
+  if (is_password(self) || !self->core->settings().enabled) {
+    drop_composition(engine, self);
     return FALSE;
-
-  auto &cfg = self->core->settings();
-
-  auto passthrough_printable = [&]() -> gboolean {
-    gunichar uc = ibus_keyval_to_unicode(keyval);
-    if (uc == 0 || g_unichar_iscntrl(uc))
-      return FALSE;
-    char buf[8]{};
-    gint len = g_unichar_to_utf8(uc, buf);
-    if (len <= 0)
-      return FALSE;
-    commit_utf8(engine, std::string(buf, static_cast<size_t>(len)));
-    return TRUE;
-  };
-
-  if (!cfg.enabled || skip_auto(self)) {
-    if (keyval == IBUS_KEY_BackSpace || keyval == IBUS_KEY_Return ||
-        keyval == IBUS_KEY_KP_Enter || keyval == IBUS_KEY_Tab ||
-        keyval == IBUS_KEY_space)
-      return FALSE;
-    return passthrough_printable();
   }
 
   if (keyval == IBUS_KEY_BackSpace) {
-    self->core->on_backspace();
-    committed_pop(self);
-    return FALSE;
-  }
-  if (keyval == IBUS_KEY_Escape || keyval == IBUS_KEY_Left ||
-      keyval == IBUS_KEY_Right || keyval == IBUS_KEY_Up ||
-      keyval == IBUS_KEY_Down || keyval == IBUS_KEY_Home ||
-      keyval == IBUS_KEY_End || keyval == IBUS_KEY_Page_Up ||
-      keyval == IBUS_KEY_Page_Down || keyval == IBUS_KEY_Delete) {
-    self->core->clear_context();
-    committed_clear(self);
+    if (!self->core->buffer().current_word().empty())
+      self->core->on_backspace();
     return FALSE;
   }
 
-  if (keyval == IBUS_KEY_space && cfg.on_space) {
-    const std::string word = self->core->buffer().current_word();
-    if (auto act = self->core->on_boundary(" ")) {
-      strip_pending(*act, " ", /*keep_ws_in_insert=*/true);
-      if (!apply_replace(engine, self, *act, word)) {
-        // Keep phrase tracking; let Space through.
-        committed_add(self, " ");
-        return FALSE;
-      }
-      return TRUE;
-    }
-    // No convert — keep earlier words in committed, append the space.
-    committed_add(self, " ");
+  if (is_nav_key(keyval)) {
+    if (!(modifiers & IBUS_SHIFT_MASK))
+      drop_composition(engine, self);
     return FALSE;
   }
-  if ((keyval == IBUS_KEY_Return || keyval == IBUS_KEY_KP_Enter) &&
-      cfg.on_enter) {
-    const std::string word = self->core->buffer().current_word();
-    if (auto act = self->core->on_boundary("\n")) {
-      strip_pending(*act, "\n", /*keep_ws_in_insert=*/false);
-      if (!apply_replace(engine, self, *act, word)) {
-        /* keep committed; Enter goes to app */
-      } else {
-        committed_clear(self);
-        self->core->clear_context();
-      }
-    } else {
-      committed_clear(self);
-    }
-    return FALSE;
-  }
-  if (keyval == IBUS_KEY_Tab && cfg.on_tab) {
-    const std::string word = self->core->buffer().current_word();
-    if (auto act = self->core->on_boundary("\t")) {
-      strip_pending(*act, "\t", /*keep_ws_in_insert=*/false);
-      (void)apply_replace(engine, self, *act, word);
-    }
-    committed_clear(self);
+
+  auto &cfg = self->core->settings();
+  const bool auto_ok = !skip_auto(self);
+
+  if (auto_ok && keyval == IBUS_KEY_space && cfg.on_space)
+    return commit_boundary(engine, self, " ");
+  if (auto_ok && (keyval == IBUS_KEY_Return || keyval == IBUS_KEY_KP_Enter) &&
+      cfg.on_enter)
+    return commit_boundary(engine, self, "\n");
+  if (auto_ok && keyval == IBUS_KEY_Tab && cfg.on_tab)
+    return commit_boundary(engine, self, "\t");
+
+  if (is_dead_or_compose(keyval)) {
+    drop_composition(engine, self);
     return FALSE;
   }
 
   gunichar uc = ibus_keyval_to_unicode(keyval);
-  if (uc == 0 || g_unichar_iscntrl(uc))
+  if (uc == 0 || g_unichar_iscntrl(uc)) {
+    if (!is_modifier_key(keyval))
+      drop_composition(engine, self);
     return FALSE;
+  }
 
   char buf[8]{};
   gint len = g_unichar_to_utf8(uc, buf);
   if (len <= 0)
     return FALSE;
-  std::string ch(buf, static_cast<size_t>(len));
-
-  commit_utf8(engine, ch);
-  committed_add(self, ch);
-  self->core->on_text(ch);
-  if (cfg.auto_enabled && cfg.live_fix) {
-    if (auto act = self->core->maybe_live_fix()) {
-      const std::string &w = self->core->buffer().current_word();
-      (void)apply_replace(engine, self, *act, w);
-    }
-  }
-  return TRUE;
+  self->core->on_text(std::string(buf, static_cast<size_t>(len)));
+  return FALSE;
 }
 
 static void keyboop_focus_in(IBusEngine *engine) {
@@ -803,22 +778,22 @@ static void keyboop_enable(IBusEngine *engine) {
 
 static void keyboop_focus_out(IBusEngine *engine) {
   auto *self = reinterpret_cast<KeyboopEngine *>(engine);
-  if (self->core)
-    self->core->clear_context();
-  committed_clear(self);
+  drop_composition(engine, self);
 }
 
 static void keyboop_reset(IBusEngine *engine) {
   auto *self = reinterpret_cast<KeyboopEngine *>(engine);
-  ibus_engine_hide_preedit_text(engine);
-  if (self->core)
-    self->core->clear_context();
-  committed_clear(self);
+  drop_composition(engine, self);
 }
 
 static void keyboop_set_content_type(IBusEngine *engine, guint purpose,
                                      guint /*hints*/) {
-  reinterpret_cast<KeyboopEngine *>(engine)->purpose = purpose;
+  auto *self = reinterpret_cast<KeyboopEngine *>(engine);
+  if (purpose != self->purpose &&
+      (purpose == IBUS_INPUT_PURPOSE_PASSWORD ||
+       purpose == IBUS_INPUT_PURPOSE_PIN))
+    drop_composition(engine, self);
+  self->purpose = purpose;
 }
 
 static void keyboop_set_capabilities(IBusEngine *engine, guint caps) {
@@ -851,7 +826,6 @@ static void keyboop_engine_class_init(KeyboopEngineClass *klass) {
 }
 
 std::string engine_language_code(const keyboop::XkbLayoutId &id) {
-  // GNOME/IBus prefer ISO 639-2 for the menu label ("Английский" / "Русский").
   if (id.layout == "ru")
     return "rus";
   if (id.layout == "ua")
@@ -880,7 +854,7 @@ std::string engine_symbol(const keyboop::XkbLayoutId &id) {
   if (id.layout == "by")
     return "by";
   if (!id.layout.empty())
-    return id.layout; // "ru", "de", …
+    return id.layout;
   return "en";
 }
 
@@ -905,7 +879,6 @@ IBusEngineDesc *make_desc(const keyboop::XkbLayoutId &id) {
   std::string longname = engine_longname(id);
   std::string lang = engine_language_code(id);
   std::string symbol = engine_symbol(id);
-  // Always use varargs so we can set symbol (panel en/ru, not en₁/en₂).
   if (id.variant.empty()) {
     return ibus_engine_desc_new_varargs(
         "name", name.c_str(), "longname", longname.c_str(), "description",

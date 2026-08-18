@@ -1,5 +1,6 @@
 # Keyboop — thin Make front-end over CMake.
-# Usage: make | make test | sudo make install | make FCITX=ON
+# Usage: make | make test | sudo make install | make FCITX=ON | make IBUS=OFF
+# A requested IBus/Fcitx backend fails configure if headers are missing.
 
 BUILD ?= build
 PREFIX ?= /usr

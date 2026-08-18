@@ -6,10 +6,12 @@ pkgdesc="RU/EN layout auto-switch for Wayland (IBus on GNOME)"
 arch=('x86_64')
 url="https://github.com/grmllnn/keyboob"
 license=('MIT')
-depends=('ibus' 'libxkbcommon' 'gcc-libs' 'glibc')
+depends=('ibus' 'libxkbcommon' 'gcc-libs' 'glibc' 'glib2')
 makedepends=('cmake' 'ninja' 'nlohmann-json' 'pkgconf' 'ibus')
 optdepends=(
-  'fcitx5: optional addon (KEYBOOP_BUILD_FCITX=ON), not for GNOME'
+  'fcitx5: optional addon (build with KEYBOOP_BUILD_FCITX=ON), not for GNOME'
+  'wl-clipboard: PRIMARY selection fallback on Wayland (wl-paste)'
+  'xclip: PRIMARY selection fallback on X11'
 )
 source=()
 

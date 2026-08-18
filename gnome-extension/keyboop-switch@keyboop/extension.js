@@ -20,6 +20,10 @@ const IFACE = `
       <arg type="b" direction="out" name="ok"/>
       <arg type="s" direction="out" name="detail"/>
     </method>
+    <method name="Status">
+      <arg type="b" direction="out" name="ok"/>
+      <arg type="s" direction="out" name="detail"/>
+    </method>
   </interface>
 </node>`;
 
@@ -43,6 +47,18 @@ class KeyboopSwitchDBus {
         have.push(`${sources[k].type}:${sources[k].id}`);
     }
     return [false, `not found ${id}; have ${have.join(',')}`];
+  }
+
+  Status() {
+    if (!getInputSourceManager)
+      return [false, 'getInputSourceManager unavailable'];
+    const sources = getInputSourceManager().inputSources;
+    const have = [];
+    for (const k in sources) {
+      if (Object.prototype.hasOwnProperty.call(sources, k))
+        have.push(`${sources[k].type}:${sources[k].id}`);
+    }
+    return [true, have.join(',')];
   }
 }
 

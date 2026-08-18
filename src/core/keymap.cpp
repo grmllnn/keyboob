@@ -17,6 +17,8 @@ const std::pair<const char *, const char *> kBasePairs[] = {
 const std::pair<const char *, const char *> kShiftedPunctPairs[] = {
     {"~", "Ё"}, {"{", "Х"}, {"}", "Ъ"}, {":", "Ж"},
     {"\"", "Э"}, {"<", "Б"}, {">", "Ю"}, {"?", ","},
+    // Number row (US Shift+2..7). Do not overwrite unshifted ; , .
+    {"@", "\""}, {"#", "№"}, {"$", ";"}, {"^", ":"}, {"&", "?"},
 };
 
 std::unordered_map<std::string, std::string> build_en_to_ru() {

@@ -40,8 +40,15 @@ std::string gnome_sources_backup_path();
 /// Copy + enable keyboop-switch@keyboop (needs one GNOME session restart).
 bool install_keyboop_switch_extension(std::string *err = nullptr);
 
-/// Activate a keyboop IBus engine after convert via detached `ibus engine`
-/// (must not wait — switch tears down the calling engine process).
-bool activate_gnome_ibus_engine(const std::string &engine_name);
+struct GnomeSwitchStatus {
+  bool ok = false;
+  std::string detail;
+};
+
+/// D-Bus Status on the Shell extension (session capability, not distro).
+GnomeSwitchStatus gnome_switch_extension_status();
+
+std::vector<std::string> ibus_component_candidate_paths();
+std::vector<std::string> gnome_extension_candidate_paths();
 
 } // namespace keyboop

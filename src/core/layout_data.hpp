@@ -3,6 +3,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace keyboop {
 
@@ -12,6 +13,9 @@ public:
 
   /// Load from KEYBOOP_DATA_DIR or given path. Returns false on failure.
   bool load(const std::string &data_dir);
+
+  /// Env, then install dir, then compile-time source data dir.
+  bool load_from_search_path();
 
   bool is_loaded() const { return loaded_; }
 
@@ -52,5 +56,7 @@ private:
   std::unordered_set<std::string> words_en_;
   bool loaded_ = false;
 };
+
+std::vector<std::string> layout_data_search_paths();
 
 } // namespace keyboop

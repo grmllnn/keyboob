@@ -48,8 +48,16 @@ target_link_libraries(keyboop_core PUBLIC
 
 set(KEYBOOP_DATA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/data" CACHE PATH
   "Path to trigrams_*.json and words_*.json")
+set(KEYBOOP_INSTALL_DATADIR "${CMAKE_INSTALL_FULL_DATAROOTDIR}/keyboop")
+set(KEYBOOP_INSTALL_LIBEXECDIR "${CMAKE_INSTALL_FULL_LIBEXECDIR}")
+set(KEYBOOP_INSTALL_IBUS_COMPONENT
+    "${CMAKE_INSTALL_FULL_DATAROOTDIR}/ibus/component/keyboop.xml")
+set(KEYBOOP_INSTALL_EXTENSION_DIR
+    "${CMAKE_INSTALL_FULL_DATAROOTDIR}/keyboop/gnome-extension/keyboop-switch@keyboop")
+
 target_compile_definitions(keyboop_core PUBLIC
-  KEYBOOP_DEFAULT_DATA_DIR="${KEYBOOP_DATA_DIR}")
+  KEYBOOP_DEFAULT_DATA_DIR="${KEYBOOP_DATA_DIR}"
+  KEYBOOP_INSTALL_DATADIR="${KEYBOOP_INSTALL_DATADIR}")
 
 add_library(keyboop_platform STATIC
   src/platform/gnome_sources.cpp
@@ -60,8 +68,13 @@ target_include_directories(keyboop_platform PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src/core)
 target_link_libraries(keyboop_platform PUBLIC keyboop_core)
 target_compile_definitions(keyboop_platform PUBLIC
-  KEYBOOP_EXTENSION_DIR="${CMAKE_CURRENT_SOURCE_DIR}/gnome-extension/keyboop-switch@keyboop")
+  KEYBOOP_EXTENSION_DIR="${CMAKE_CURRENT_SOURCE_DIR}/gnome-extension/keyboop-switch@keyboop"
+  KEYBOOP_INSTALL_EXTENSION_DIR="${KEYBOOP_INSTALL_EXTENSION_DIR}"
+  KEYBOOP_INSTALL_IBUS_COMPONENT="${KEYBOOP_INSTALL_IBUS_COMPONENT}"
+  KEYBOOP_INSTALL_LIBEXECDIR="${KEYBOOP_INSTALL_LIBEXECDIR}")
 
+add_executable(keyboopctl src/ctl/keyboopctl.cpp)
+target_link_libraries(keyboopctl PRIVATE keyboop_core keyboop_platform)
 
 if(KEYBOOP_BUILD_TESTS)
   enable_testing()
@@ -70,57 +83,53 @@ if(KEYBOOP_BUILD_TESTS)
   add_test(NAME keyboop_core_tests COMMAND keyboop_core_tests)
   set_tests_properties(keyboop_core_tests PROPERTIES
     ENVIRONMENT "KEYBOOP_DATA_DIR=${KEYBOOP_DATA_DIR}")
+  add_test(NAME keyboop_smoke
+           COMMAND /bin/sh "${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh"
+                   $<TARGET_FILE:keyboopctl>
+                   $<TARGET_FILE:keyboop_core_tests>
+                   "${KEYBOOP_DATA_DIR}")
+  set_tests_properties(keyboop_smoke PROPERTIES
+    ENVIRONMENT "KEYBOOP_DATA_DIR=${KEYBOOP_DATA_DIR}")
 endif()
-
-add_executable(keyboopctl src/ctl/keyboopctl.cpp)
-target_link_libraries(keyboopctl PRIVATE keyboop_core keyboop_platform)
 
 # --- IBus engine (default ON) ---
 if(KEYBOOP_BUILD_IBUS)
-  pkg_check_modules(IBUS IMPORTED_TARGET ibus-1.0)
-  if(IBUS_FOUND)
-    add_executable(ibus-engine-keyboop src/ibus/ibus_engine_main.cpp)
-    target_link_libraries(ibus-engine-keyboop PRIVATE
-      keyboop_core keyboop_platform PkgConfig::IBUS)
-    target_compile_definitions(ibus-engine-keyboop PRIVATE
-      KEYBOOP_LIBEXECDIR="${CMAKE_INSTALL_FULL_LIBEXECDIR}")
-    install(TARGETS ibus-engine-keyboop
-            RUNTIME DESTINATION ${CMAKE_INSTALL_LIBEXECDIR})
+  pkg_check_modules(IBUS REQUIRED IMPORTED_TARGET ibus-1.0)
+  add_executable(ibus-engine-keyboop src/ibus/ibus_engine_main.cpp)
+  target_link_libraries(ibus-engine-keyboop PRIVATE
+    keyboop_core keyboop_platform PkgConfig::IBUS)
+  target_compile_definitions(ibus-engine-keyboop PRIVATE
+    KEYBOOP_LIBEXECDIR="${KEYBOOP_INSTALL_LIBEXECDIR}")
+  install(TARGETS ibus-engine-keyboop
+          RUNTIME DESTINATION ${CMAKE_INSTALL_LIBEXECDIR})
 
-    set(KEYBOOP_LIBEXECDIR "${CMAKE_INSTALL_FULL_LIBEXECDIR}")
-    configure_file(src/ibus/keyboop.xml.in
-                   ${CMAKE_CURRENT_BINARY_DIR}/keyboop.xml @ONLY)
-    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/keyboop.xml
-            DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/ibus/component")
-    message(STATUS "IBus engine: ENABLED")
-  else()
-    message(STATUS "IBus not found — engine skipped (install ibus-devel)")
-  endif()
+  set(KEYBOOP_LIBEXECDIR "${KEYBOOP_INSTALL_LIBEXECDIR}")
+  configure_file(src/ibus/keyboop.xml.in
+                 ${CMAKE_CURRENT_BINARY_DIR}/keyboop.xml @ONLY)
+  install(FILES ${CMAKE_CURRENT_BINARY_DIR}/keyboop.xml
+          DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/ibus/component")
+  message(STATUS "IBus engine: ENABLED")
 endif()
 
 # --- Fcitx5 addon (optional, OFF by default) ---
 if(KEYBOOP_BUILD_FCITX)
-  find_package(Fcitx5Core QUIET)
-  if(Fcitx5Core_FOUND)
-    add_library(keyboop MODULE src/fcitx5/keyboop_addon.cpp)
-    target_link_libraries(keyboop PRIVATE keyboop_core Fcitx5::Core)
-    target_include_directories(keyboop PRIVATE src/fcitx5)
-    set_target_properties(keyboop PROPERTIES PREFIX "" OUTPUT_NAME "keyboop")
-    if(DEFINED FCITX_INSTALL_ADDONDIR)
-      set(_addon_dir "${FCITX_INSTALL_ADDONDIR}")
-    else()
-      set(_addon_dir "${CMAKE_INSTALL_LIBDIR}/fcitx5")
-    endif()
-    install(TARGETS keyboop DESTINATION ${_addon_dir})
-    install(FILES src/fcitx5/keyboop.conf
-            DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/fcitx5/addon")
-    install(FILES src/fcitx5/keyboop-config.desc
-            DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/fcitx5/configdesc"
-            RENAME keyboop.desc)
-    message(STATUS "Fcitx5 addon: ENABLED")
+  find_package(Fcitx5Core REQUIRED)
+  add_library(keyboop MODULE src/fcitx5/keyboop_addon.cpp)
+  target_link_libraries(keyboop PRIVATE keyboop_core keyboop_platform Fcitx5::Core)
+  target_include_directories(keyboop PRIVATE src/fcitx5)
+  set_target_properties(keyboop PROPERTIES PREFIX "" OUTPUT_NAME "keyboop")
+  if(DEFINED FCITX_INSTALL_ADDONDIR)
+    set(_addon_dir "${FCITX_INSTALL_ADDONDIR}")
   else()
-    message(STATUS "Fcitx5 not found — addon skipped")
+    set(_addon_dir "${CMAKE_INSTALL_LIBDIR}/fcitx5")
   endif()
+  install(TARGETS keyboop DESTINATION ${_addon_dir})
+  install(FILES src/fcitx5/keyboop.conf
+          DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/fcitx5/addon")
+  install(FILES src/fcitx5/keyboop-config.desc
+          DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/fcitx5/configdesc"
+          RENAME keyboop.desc)
+  message(STATUS "Fcitx5 addon: ENABLED")
 endif()
 
 install(TARGETS keyboopctl RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

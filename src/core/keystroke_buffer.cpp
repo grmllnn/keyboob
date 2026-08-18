@@ -82,20 +82,12 @@ KeystrokeBuffer::word_for_conversion(bool completed_only) const {
   if (completed_only) {
     if (last_word_.empty())
       return std::nullopt;
-    return WordForConversion{
-        last_word_,
-        static_cast<int>(utf8_length(last_word_) + utf8_length(last_tail_) +
-                         utf8_length(current_word_)),
-        last_tail_ + current_word_};
+    return WordForConversion{last_word_, last_tail_ + current_word_};
   }
   if (!current_word_.empty())
-    return WordForConversion{current_word_,
-                             static_cast<int>(utf8_length(current_word_)), ""};
+    return WordForConversion{current_word_, ""};
   if (!last_word_.empty())
-    return WordForConversion{
-        last_word_,
-        static_cast<int>(utf8_length(last_word_) + utf8_length(last_tail_)),
-        last_tail_};
+    return WordForConversion{last_word_, last_tail_};
   return std::nullopt;
 }
 
@@ -117,7 +109,7 @@ KeystrokeBuffer::group_for_conversion() const {
   }
   if (total <= 0 || total > kGroupMaxChars)
     return std::nullopt;
-  return GroupForConversion{std::move(words), total};
+  return GroupForConversion{std::move(words)};
 }
 
 void KeystrokeBuffer::apply_conversion(const std::string &converted) {

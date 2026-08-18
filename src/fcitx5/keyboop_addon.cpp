@@ -1,13 +1,17 @@
 /*
- * Keyboop Fcitx5 addon — Wayland-safe layout auto-switch for RU/EN.
+ * Keyboop Fcitx5 addon — Wayland-safe layout auto-switch.
  * Requires Fcitx5 headers at build time (fcitx5-devel).
  */
+#include "active_keymap.hpp"
 #include "engine.hpp"
 #include "layout_data.hpp"
+#include "user_settings.hpp"
 #include "utf8.hpp"
+#include "xkb_pair.hpp"
 
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -57,49 +61,12 @@ FCITX_CONFIGURATION(
 class KeyboopState : public InputContextProperty {
 public:
   keyboop::Engine engine;
-  bool muted = false; // ignore our own synthetic commits
+  bool muted = false;
   uint64_t last_hotkey_us = 0;
 };
 
 bool can_replace(InputContext *ic) {
   return ic->capabilityFlags().test(CapabilityFlag::SurroundingText);
-}
-
-// Engine delete_count may include pending boundary chars not yet on screen.
-// Snippet actions do NOT include them — only strip when counts match.
-void strip_pending_boundary(keyboop::ReplaceAction &act, std::string_view ws,
-                            bool keep_ws_in_insert) {
-  if (ws.empty() || act.insert.size() < ws.size() || !act.insert.ends_with(ws))
-    return;
-  const int n = static_cast<int>(keyboop::utf8_length(ws));
-  const int insert_wo =
-      static_cast<int>(keyboop::utf8_length(act.insert) - n);
-  if (act.delete_count == insert_wo + n)
-    act.delete_count = insert_wo;
-  if (!keep_ws_in_insert)
-    act.insert.resize(act.insert.size() - ws.size());
-}
-
-void strip_pending_char(keyboop::ReplaceAction &act, std::string_view ch) {
-  const int n = static_cast<int>(keyboop::utf8_length(ch));
-  if (n > 0 && act.delete_count >= n)
-    act.delete_count -= n;
-}
-
-bool name_looks_cyrillic(std::string_view name) {
-  return name.find("ru") != std::string_view::npos ||
-         name.find("russian") != std::string_view::npos ||
-         name.find("ukrain") != std::string_view::npos ||
-         name.find("belar") != std::string_view::npos ||
-         name.find("by") != std::string_view::npos ||
-         name.find("ua") != std::string_view::npos;
-}
-
-bool name_looks_latin(std::string_view name) {
-  return name.find("us") != std::string_view::npos ||
-         name.find("en") != std::string_view::npos ||
-         name.find("gb") != std::string_view::npos ||
-         name.find("intl") != std::string_view::npos;
 }
 
 class KeyboopModule final : public AddonInstance {
@@ -113,10 +80,7 @@ public:
           applySettings(st->engine);
           return st;
         }) {
-    const char *env = std::getenv("KEYBOOP_DATA_DIR");
-    std::string dataDir = env ? env : std::string(KEYBOOP_DEFAULT_DATA_DIR);
-    if (!keyboop::LayoutData::shared().load(dataDir))
-      keyboop::LayoutData::shared().load("/usr/share/keyboop");
+    keyboop::LayoutData::shared().load_from_search_path();
 
     instance_->inputContextManager().registerProperty("keyboopState",
                                                       &factory_);
@@ -151,7 +115,6 @@ public:
   void setConfig(const RawConfig &config) override {
     config_.load(config, true);
     safeSaveAsIni(config_, configFile);
-    // Live IC engines pick up config_ on next key via applySettings.
   }
 
 private:
@@ -166,44 +129,82 @@ private:
     s.hotkey_mode = *config_.hotkeyMode;
     s.double_tap_timeout_ms = *config_.doubleTapTimeoutMs;
     s.manual_hotkeys.clear();
-    for (const auto &k : config_.manualHotkey.value())
-      s.manual_hotkeys.push_back(k.toString());
+    auto us = keyboop::load_user_settings();
+    {
+      std::ifstream in(keyboop::user_config_path());
+      if (in)
+        s.auto_enabled = us.auto_enabled;
+    }
+    if (!us.hotkey.empty())
+      s.manual_hotkeys.push_back(us.hotkey);
+    else {
+      for (const auto &k : config_.manualHotkey.value())
+        s.manual_hotkeys.push_back(k.toString());
+    }
   }
 
-  void applyReplace(InputContext *ic, const keyboop::ReplaceAction &act) {
-    if (act.delete_count <= 0 && act.insert.empty())
-      return;
+  void refreshKeymap() {
+    auto &imm = instance_->inputMethodManager();
+    const auto &group = imm.currentGroup();
+    std::vector<keyboop::XkbLayoutId> layouts;
+    for (const auto &item : group.inputMethodList()) {
+      auto id = keyboop::parse_fcitx_im_name(item.name());
+      if (!id.empty())
+        layouts.push_back(std::move(id));
+    }
+    keyboop::XkbLayoutId active;
+    if (auto *mic = instance_->mostRecentInputContext())
+      active = keyboop::parse_fcitx_im_name(instance_->inputMethod(mic));
+    auto pair = keyboop::pick_latin_cyrillic_pair(
+        layouts, active.empty() ? nullptr : &active);
+    if (pair.ok)
+      keyboop::ActiveKeymap::shared().use_pair(std::move(pair));
+  }
+
+  bool applyReplace(InputContext *ic, const keyboop::ReplaceAction &act,
+                    std::string_view pending_uncommitted = {}) {
+    if (act.expected.empty() && act.replacement.empty())
+      return false;
+    std::string expect = act.expected;
+    if (!pending_uncommitted.empty() &&
+        expect.size() >= pending_uncommitted.size() &&
+        expect.ends_with(pending_uncommitted)) {
+      expect.resize(expect.size() - pending_uncommitted.size());
+    }
+    if (!keyboop::utf8_valid(expect) || !keyboop::utf8_valid(act.replacement))
+      return false;
+
+    const int n = static_cast<int>(keyboop::utf8_length(expect));
+    if (can_replace(ic) && n > 0) {
+      const auto &stxt = ic->surroundingText();
+      auto match = keyboop::match_expected_at_caret(stxt.text(), stxt.cursor(),
+                                                    expect);
+      if (!match.ok)
+        return false;
+    }
+
     auto *st = ic->propertyFor(&factory_);
     st->muted = true;
-    if (act.delete_count > 0)
-      ic->deleteSurroundingText(-act.delete_count, act.delete_count);
-    if (!act.insert.empty())
-      ic->commitString(act.insert);
+    if (n > 0)
+      ic->deleteSurroundingText(-n, n);
+    if (!act.replacement.empty())
+      ic->commitString(act.replacement);
     st->muted = false;
+    return true;
   }
 
   void maybeSwitchLayout(bool to_cyrillic) {
     if (!*config_.switchLayout)
       return;
+    refreshKeymap();
+    auto &km = keyboop::ActiveKeymap::shared();
+    const auto &id =
+        to_cyrillic ? km.cyrillic_layout() : km.latin_layout();
     auto &imm = instance_->inputMethodManager();
-    const auto &group = imm.currentGroup();
-    std::string current;
-    if (auto *mic = instance_->mostRecentInputContext())
-      current = instance_->inputMethod(mic);
-    std::string best;
-    for (const auto &item : group.inputMethodList()) {
-      const std::string &name = item.name();
-      if (name == current)
-        continue;
-      if (to_cyrillic && name_looks_cyrillic(name)) {
-        best = name;
-        break;
-      }
-      if (!to_cyrillic && name_looks_latin(name) && !name_looks_cyrillic(name)) {
-        best = name;
-        break;
-      }
-    }
+    std::vector<std::string> names;
+    for (const auto &item : imm.currentGroup().inputMethodList())
+      names.push_back(item.name());
+    auto best = keyboop::fcitx_im_for_layout(names, id);
     if (!best.empty())
       instance_->setCurrentInputMethod(best);
   }
@@ -211,18 +212,23 @@ private:
   bool tryManual(InputContext *ic, KeyboopState *st) {
     if (!can_replace(ic))
       return false;
+    refreshKeymap();
     if (auto act = st->engine.manual_convert()) {
-      applyReplace(ic, *act);
-      maybeSwitchLayout(act->switch_to_cyrillic);
-      return true;
+      if (applyReplace(ic, *act)) {
+        maybeSwitchLayout(act->switch_to_cyrillic);
+        return true;
+      }
     }
     return false;
   }
 
   bool isManualHotkey(const Key &key, KeyboopState *st) {
+    auto us = keyboop::load_user_settings();
+    const bool fileHit =
+        !us.hotkey.empty() && key.check(Key(us.hotkey.c_str()));
     const std::string mode = *config_.hotkeyMode;
     if (mode == "doubletap") {
-      if (!key.checkKeyList(config_.manualHotkey.value()))
+      if (!fileHit && !key.checkKeyList(config_.manualHotkey.value()))
         return false;
       const uint64_t now = nowMicros();
       const uint64_t win =
@@ -233,8 +239,8 @@ private:
       st->last_hotkey_us = now;
       return hit;
     }
-    // combo | key | modkey — KeyList match (modkey alone needs release tracking;
-    // ponytail: treat modkey like combo until a dedicated release watcher exists)
+    if (fileHit)
+      return true;
     return key.checkKeyList(config_.manualHotkey.value());
   }
 
@@ -246,19 +252,17 @@ private:
             .count());
   }
 
-  void handleBoundary(KeyEvent &keyEvent, InputContext *ic, KeyboopState *st,
-                      std::string_view ws, bool let_key_through) {
+  void handleBoundary(InputContext *ic, KeyboopState *st, std::string_view ws) {
+    if (st->engine.buffer().current_word().empty())
+      return;
     if (!can_replace(ic)) {
-      // Can't deleteSurroundingText here — keep buffer in sync only.
       st->engine.buffer().boundary(ws);
       return;
     }
+    refreshKeymap();
     if (auto act = st->engine.on_boundary(ws)) {
-      strip_pending_boundary(*act, ws, /*keep_ws_in_insert=*/!let_key_through);
-      applyReplace(ic, *act);
-      maybeSwitchLayout(act->switch_to_cyrillic);
-      if (!let_key_through)
-        keyEvent.filterAndAccept();
+      if (applyReplace(ic, *act))
+        maybeSwitchLayout(act->switch_to_cyrillic);
     }
   }
 
@@ -298,18 +302,16 @@ private:
 
     auto &cfg = st->engine.settings();
     if (key.check(FcitxKey_space) && cfg.on_space) {
-      handleBoundary(keyEvent, ic, st, " ", /*let_key_through=*/false);
+      handleBoundary(ic, st, " ");
       return;
     }
     if ((key.check(FcitxKey_Return) || key.check(FcitxKey_KP_Enter)) &&
         cfg.on_enter) {
-      // Let Enter reach the app (chat send / newline) after we fix the word.
-      handleBoundary(keyEvent, ic, st, "\n", /*let_key_through=*/true);
+      handleBoundary(ic, st, "\n");
       return;
     }
     if (key.check(FcitxKey_Tab) && cfg.on_tab) {
-      // Tab often moves focus — don't swallow it as a literal \t.
-      handleBoundary(keyEvent, ic, st, "\t", /*let_key_through=*/true);
+      handleBoundary(ic, st, "\t");
       return;
     }
 
@@ -347,11 +349,10 @@ private:
       return;
 
     if (auto act = st->engine.maybe_live_fix()) {
-      // Current key not committed yet — it's in the buffer/insert, not on screen.
-      strip_pending_char(*act, ch);
-      applyReplace(ic, *act);
-      maybeSwitchLayout(act->switch_to_cyrillic);
-      keyEvent.filterAndAccept();
+      if (applyReplace(ic, *act, ch)) {
+        maybeSwitchLayout(act->switch_to_cyrillic);
+        keyEvent.filterAndAccept();
+      }
     }
   }
 

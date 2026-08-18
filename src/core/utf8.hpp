@@ -349,24 +349,12 @@ inline LayoutFlipAt layout_flip_at(std::string_view phrase, size_t cursor_cp) {
   size_t lo = anchor;
   size_t hi = anchor + 1;
 
-  // Expanding left: allow spaces only if preceded by the same script (want)
+  // One token: letters plus attached punctuation (hf,jnftn, xtuj-b,elm).
+  // Spaces do not glue words — selecting "gbitv" must not eat "xtuj-b,elm".
   while (lo > 0) {
     uint32_t cp = cps[lo - 1].cp;
-    if (cp == '\n' || cp == '\r')
+    if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r')
       break;
-    if (cp == ' ' || cp == '\t') {
-      size_t k = lo - 1;
-      while (k > 0 && (cps[k - 1].cp == ' ' || cps[k - 1].cp == '\t'))
-        --k;
-      if (k > 0) {
-        int sc = letter_script(cps[k - 1].cp);
-        if (sc == want) {
-          lo = k;
-          continue;
-        }
-      }
-      break;
-    }
     int sc = letter_script(cp);
     if (sc == want || sc == 0)
       --lo;
@@ -374,24 +362,10 @@ inline LayoutFlipAt layout_flip_at(std::string_view phrase, size_t cursor_cp) {
       break;
   }
 
-  // Expanding right: allow spaces only if followed by the same script (want)
   while (hi < cps.size()) {
     uint32_t cp = cps[hi].cp;
-    if (cp == '\n' || cp == '\r')
+    if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r')
       break;
-    if (cp == ' ' || cp == '\t') {
-      size_t k = hi + 1;
-      while (k < cps.size() && (cps[k].cp == ' ' || cps[k].cp == '\t'))
-        ++k;
-      if (k < cps.size()) {
-        int sc = letter_script(cps[k].cp);
-        if (sc == want) {
-          hi = k;
-          continue;
-        }
-      }
-      break;
-    }
     int sc = letter_script(cp);
     if (sc == want || sc == 0)
       ++hi;
@@ -413,6 +387,146 @@ inline LayoutFlipAt layout_flip_at(std::string_view phrase, size_t cursor_cp) {
       (hi < cps.size()) ? cps[hi].off : phrase.size();
   out.text = std::string(phrase.substr(byte0, byte1 - byte0));
   return out;
+}
+
+inline bool utf8_valid(std::string_view s) {
+  const unsigned char *p = reinterpret_cast<const unsigned char *>(s.data());
+  const unsigned char *end = p + s.size();
+  while (p < end) {
+    if (*p < 0x80) {
+      ++p;
+      continue;
+    }
+    int extra = 0;
+    uint32_t min_cp = 0;
+    uint32_t cp = 0;
+    if ((*p & 0xE0) == 0xC0) {
+      extra = 1;
+      cp = *p & 0x1F;
+      min_cp = 0x80;
+    } else if ((*p & 0xF0) == 0xE0) {
+      extra = 2;
+      cp = *p & 0x0F;
+      min_cp = 0x800;
+    } else if ((*p & 0xF8) == 0xF0) {
+      extra = 3;
+      cp = *p & 0x07;
+      min_cp = 0x10000;
+    } else {
+      return false;
+    }
+    ++p;
+    for (int i = 0; i < extra; ++i) {
+      if (p >= end || (*p & 0xC0) != 0x80)
+        return false;
+      cp = (cp << 6) | (*p & 0x3F);
+      ++p;
+    }
+    if (cp < min_cp || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
+      return false;
+  }
+  return true;
+}
+
+inline std::string utf8_slice_cp(std::string_view s, size_t from_cp,
+                                 size_t to_cp) {
+  if (to_cp <= from_cp)
+    return {};
+  size_t i = 0;
+  size_t byte0 = s.size();
+  size_t byte1 = s.size();
+  Utf8Iter it(s);
+  while (it.ok()) {
+    const unsigned char *start = it.p;
+    it.next();
+    if (i == from_cp)
+      byte0 = static_cast<size_t>(
+          start - reinterpret_cast<const unsigned char *>(s.data()));
+    ++i;
+    if (i == to_cp) {
+      byte1 = static_cast<size_t>(
+          it.p - reinterpret_cast<const unsigned char *>(s.data()));
+      break;
+    }
+  }
+  if (from_cp >= i)
+    return {};
+  if (byte0 > s.size() || byte1 > s.size() || byte1 < byte0)
+    return {};
+  return std::string(s.substr(byte0, byte1 - byte0));
+}
+
+/// PRIMARY / expected span is usable only if it equals surrounding at/near caret.
+/// IBus: replace a tracked word only when this span matches, or when the
+/// adapter falls back to suffix Backspace (no surrounding / laggy Qt).
+/// no match → no-op (never apply ReplaceAction as commit-only).
+struct SurroundingSpan {
+  size_t start_cp = 0;
+  size_t end_cp = 0;
+  bool ok = false;
+};
+
+inline SurroundingSpan match_span_touching_caret(std::string_view surrounding,
+                                                 size_t cursor_cp,
+                                                 std::string_view needle) {
+  SurroundingSpan out;
+  if (needle.empty() || !utf8_valid(surrounding) || !utf8_valid(needle))
+    return out;
+  const size_t n = utf8_length(needle);
+  const size_t sn = utf8_length(surrounding);
+  if (n == 0 || sn < n)
+    return out;
+  if (cursor_cp > sn)
+    cursor_cp = sn;
+  size_t best = sn + 1;
+  for (size_t s = 0; s + n <= sn; ++s) {
+    if (cursor_cp < s || cursor_cp > s + n)
+      continue;
+    if (utf8_slice_cp(surrounding, s, s + n) != needle)
+      continue;
+    const size_t dist = cursor_cp - s < s + n - cursor_cp ? cursor_cp - s
+                                                          : s + n - cursor_cp;
+    if (dist < best) {
+      best = dist;
+      out.start_cp = s;
+      out.end_cp = s + n;
+      out.ok = true;
+    }
+  }
+  return out;
+}
+
+inline SurroundingSpan match_expected_at_caret(std::string_view surrounding,
+                                               size_t cursor_cp,
+                                               std::string_view expected) {
+  return match_span_touching_caret(surrounding, cursor_cp, expected);
+}
+
+inline SurroundingSpan match_primary_snapshot(std::string_view surrounding,
+                                              size_t cursor_cp,
+                                              std::string_view primary) {
+  return match_span_touching_caret(surrounding, cursor_cp, primary);
+}
+
+/// Select-all: IBus surrounding is a prefix of PRIMARY and too short to place
+/// the highlight. layout_flip_at at caret 0 would convert only the first token.
+/// Caret must sit on an edge of `visible` so a leftover PRIMARY that merely
+/// starts with the current word is not treated as a selection.
+inline bool primary_extends_truncated_selection(std::string_view visible,
+                                                size_t caret_in_visible,
+                                                std::string_view primary) {
+  if (visible.empty() || primary.empty())
+    return false;
+  if (primary.size() <= visible.size())
+    return false;
+  if (primary.compare(0, visible.size(), visible.data(), visible.size()) != 0)
+    return false;
+  const size_t n = utf8_length(visible);
+  if (caret_in_visible != 0 && caret_in_visible != n)
+    return false;
+  // A single leftover word that happens to prefix PRIMARY is not a selection.
+  return visible.find(' ') != std::string_view::npos ||
+         visible.find('\n') != std::string_view::npos;
 }
 
 } // namespace keyboop

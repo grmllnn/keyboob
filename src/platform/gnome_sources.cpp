@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -194,39 +195,56 @@ bool write_gnome_input_sources(const std::vector<InputSource> &sources) {
   return run_argv_wait(argv);
 }
 
-bool activate_gnome_ibus_engine(const std::string &engine_name) {
-  // Safe charset only — passed as exec argv (no shell).
-  if (engine_name.empty() || engine_name.size() >= 64 ||
-      engine_name.find_first_not_of(
-          "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:_-") !=
-          std::string::npos)
-    return false;
-  // Must copy before fork: caller often passes a temporary std::string; after
-  // parent returns that storage is gone and grandchild would UAF → ibus gets
-  // garbage and SetGlobalEngine fails silently.
-  char name[64];
-  std::snprintf(name, sizeof(name), "%s", engine_name.c_str());
-  // Double-fork + delay: `ibus engine` tears down THIS engine process.
-  // Waiting on that switch from inside the engine deadlocks input (freeze).
-  pid_t pid = fork();
-  if (pid < 0)
-    return false;
-  if (pid == 0) {
-    pid_t grand = fork();
-    if (grand < 0)
-      _exit(127);
-    if (grand > 0)
-      _exit(0); // intermediate exits; parent waitpid returns immediately
-    setsid();
-    usleep(100000); // 100ms — let commit/idle finish before teardown
-    const char *argv[] = {"ibus", "engine", name, nullptr};
-    execvp("ibus", const_cast<char *const *>(argv));
-    _exit(127);
+std::vector<std::string> ibus_component_candidate_paths() {
+  std::vector<std::string> out;
+  if (const char *e = std::getenv("KEYBOOP_IBUS_COMPONENT"); e && e[0])
+    out.emplace_back(e);
+#ifdef KEYBOOP_INSTALL_IBUS_COMPONENT
+  out.emplace_back(KEYBOOP_INSTALL_IBUS_COMPONENT);
+#endif
+  return out;
+}
+
+std::vector<std::string> gnome_extension_candidate_paths() {
+  std::vector<std::string> out;
+  if (const char *e = std::getenv("KEYBOOP_EXTENSION_DIR"))
+    out.emplace_back(e);
+#ifdef KEYBOOP_EXTENSION_DIR
+  out.emplace_back(KEYBOOP_EXTENSION_DIR);
+#endif
+#ifdef KEYBOOP_INSTALL_EXTENSION_DIR
+  out.emplace_back(KEYBOOP_INSTALL_EXTENSION_DIR);
+#endif
+  out.emplace_back("gnome-extension/keyboop-switch@keyboop");
+  return out;
+}
+
+GnomeSwitchStatus gnome_switch_extension_status() {
+  GnomeSwitchStatus st;
+  int rc = 0;
+  auto raw = run_cmd_capture(
+      "gdbus call --session --dest org.gnome.Shell "
+      "--object-path /org/gnome/Shell/Extensions/KeyboopSwitch "
+      "--method org.gnome.Shell.Extensions.KeyboopSwitch.Status "
+      "2>/dev/null",
+      &rc);
+  if (raw.find("true") != std::string::npos) {
+    st.ok = true;
+    st.detail = raw;
+    while (!st.detail.empty() &&
+           (st.detail.back() == '\n' || st.detail.back() == ' '))
+      st.detail.pop_back();
+    return st;
   }
-  int status = 0;
-  if (waitpid(pid, &status, 0) < 0)
-    return false;
-  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+  st.ok = false;
+  st.detail = raw.empty()
+                  ? "extension not responding (enable keyboop-switch@keyboop "
+                    "and log in again)"
+                  : raw;
+  while (!st.detail.empty() &&
+         (st.detail.back() == '\n' || st.detail.back() == ' '))
+    st.detail.pop_back();
+  return st;
 }
 
 std::string gnome_sources_backup_path() {
@@ -239,9 +257,7 @@ std::string gnome_sources_backup_path() {
 bool component_xml_looks_sane() {
   // ponytail: --xml dumps only <engines>; pasting that over the component
   // file removes <component>/<exec> and GNOME ends up with zero layouts.
-  const char *paths[] = {"/usr/share/ibus/component/keyboop.xml",
-                         "/usr/local/share/ibus/component/keyboop.xml"};
-  for (const char *p : paths) {
+  for (const auto &p : ibus_component_candidate_paths()) {
     std::ifstream in(p);
     if (!in)
       continue;
@@ -264,18 +280,8 @@ bool install_keyboop_switch_extension(std::string *err) {
   fs::path dst = fs::path(home) /
                  ".local/share/gnome-shell/extensions/keyboop-switch@keyboop";
   std::vector<fs::path> candidates;
-  if (const char *env = std::getenv("KEYBOOP_EXTENSION_DIR"))
-    candidates.emplace_back(env);
-#ifdef KEYBOOP_EXTENSION_DIR
-  candidates.emplace_back(KEYBOOP_EXTENSION_DIR);
-#endif
-  candidates.emplace_back(
-      "/usr/share/keyboop/gnome-extension/keyboop-switch@keyboop");
-  candidates.emplace_back(
-      "/usr/local/share/keyboop/gnome-extension/keyboop-switch@keyboop");
-  // Dev tree next to cwd / repo
-  candidates.emplace_back(
-      "gnome-extension/keyboop-switch@keyboop");
+  for (const auto &c : gnome_extension_candidate_paths())
+    candidates.emplace_back(c);
 
   fs::path src;
   for (const auto &c : candidates) {
@@ -305,6 +311,15 @@ bool install_keyboop_switch_extension(std::string *err) {
     if (err)
       *err = "copy extension.js failed: " + ec.message();
     return false;
+  }
+  if (fs::exists(src / "prefs.js")) {
+    fs::copy_file(src / "prefs.js", dst / "prefs.js",
+                  fs::copy_options::overwrite_existing, ec);
+    if (ec) {
+      if (err)
+        *err = "copy prefs.js failed: " + ec.message();
+      return false;
+    }
   }
   // Prefer enabled-extensions; gnome-extensions enable needs Shell to know
   // the UUID (after next login). Best-effort now.
@@ -350,7 +365,7 @@ bool install_keyboop_switch_extension(std::string *err) {
 bool gnome_enable_keyboop(std::string *err) {
   if (!component_xml_looks_sane()) {
     if (err)
-      *err = "broken/missing /usr/share/ibus/component/keyboop.xml "
+      *err = "broken/missing ibus component xml "
              "(must be a full <component>, not --xml engines dump). "
              "Reinstall, then: ibus write-cache && ibus restart";
     return false;

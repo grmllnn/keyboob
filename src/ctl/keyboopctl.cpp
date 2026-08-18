@@ -9,6 +9,7 @@
 #include "xkb_pair.hpp"
 
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <string>
 
@@ -21,13 +22,153 @@ static void usage() {
       << "  gnome-disable         restore previous GNOME xkb sources\n"
       << "  layouts               show detected GNOME layouts + pair\n"
       << "  auto [on|off]         auto-convert on space (default on)\n"
+      << "  hotkey [SPEC]         manual convert combo (default Control+Alt+k)\n"
+      << "  doctor                session / IM / layouts / extension / paths\n"
       << "  version\n";
 }
 
+static std::string env_or(const char *k) {
+  const char *v = std::getenv(k);
+  return v ? v : "";
+}
+
+static bool path_ok(const std::string &p) {
+  std::error_code ec;
+  return !p.empty() && std::filesystem::exists(p, ec);
+}
+
+static bool have_bin(const char *name) {
+  const char *path = std::getenv("PATH");
+  if (!path || !name || !name[0])
+    return false;
+  std::string paths(path);
+  size_t i = 0;
+  while (i < paths.size()) {
+    size_t sep = paths.find(':', i);
+    if (sep == std::string::npos)
+      sep = paths.size();
+    std::string dir = paths.substr(i, sep - i);
+    if (!dir.empty() && path_ok(dir + "/" + name))
+      return true;
+    i = sep + 1;
+  }
+  return false;
+}
+
+static std::string detect_im_module() {
+  auto gtk = env_or("GTK_IM_MODULE");
+  auto qt = env_or("QT_IM_MODULE");
+  auto xmod = env_or("XMODIFIERS");
+  auto blob = gtk + " " + qt + " " + xmod;
+  if (blob.find("fcitx") != std::string::npos)
+    return "fcitx";
+  if (blob.find("ibus") != std::string::npos)
+    return "ibus";
+  if (!env_or("IBUS_ADDRESS").empty())
+    return "ibus";
+  return "unknown";
+}
+
+static std::string recommend_backend(const std::string &desktop,
+                                     const std::string &im) {
+  if (desktop.find("GNOME") != std::string::npos)
+    return "ibus";
+  if (im == "fcitx" || have_bin("fcitx5"))
+    return "fcitx";
+  if (im == "ibus" || have_bin("ibus"))
+    return "ibus";
+  return "none";
+}
+
+static int cmd_doctor() {
+  const std::string session = env_or("XDG_SESSION_TYPE");
+  const std::string desktop = env_or("XDG_CURRENT_DESKTOP");
+  const std::string wayland = env_or("WAYLAND_DISPLAY");
+  const std::string display = env_or("DISPLAY");
+  const std::string im = detect_im_module();
+  const std::string backend = recommend_backend(desktop, im);
+
+  std::cout << "session: " << (session.empty() ? "unknown" : session) << "\n";
+  std::cout << "desktop: " << (desktop.empty() ? "unknown" : desktop) << "\n";
+  std::cout << "display: "
+            << (!wayland.empty() ? "wayland" : (!display.empty() ? "x11" : "none"))
+            << "\n";
+  std::cout << "im: " << im << " gtk=" << env_or("GTK_IM_MODULE")
+            << " qt=" << env_or("QT_IM_MODULE") << "\n";
+  std::cout << "backend: " << backend << "\n";
+
+  auto sources = keyboop::read_gnome_input_sources();
+  std::cout << "layouts:";
+  if (sources.empty()) {
+    std::cout << " (none / not GNOME)\n";
+  } else {
+    std::cout << "\n";
+    for (const auto &s : sources) {
+      const char *k = s.kind == keyboop::InputSource::Kind::Xkb         ? "xkb"
+                      : s.kind == keyboop::InputSource::Kind::IBusKeyboop
+                          ? "keyboop"
+                          : "other";
+      std::cout << "  " << k << " " << s.id << "\n";
+    }
+    auto layouts = keyboop::layout_ids_from_sources(sources);
+    auto pair = keyboop::pick_latin_cyrillic_pair(layouts, nullptr);
+    if (pair.ok)
+      std::cout << "pair: " << pair.latin.id() << " <-> " << pair.cyrillic.id()
+                << "\n";
+    else
+      std::cout << "pair: none\n";
+  }
+
+  auto ext = keyboop::gnome_switch_extension_status();
+  std::cout << "extension: " << (ext.ok ? "ok" : "fail") << " " << ext.detail
+            << "\n";
+
+  {
+    auto us = keyboop::load_user_settings();
+    auto cfg = keyboop::user_config_path();
+    std::cout << "auto: " << (us.auto_enabled ? "on" : "off")
+              << " hotkey=" << us.hotkey << " " << cfg
+              << (path_ok(cfg) ? " (ok)" : " (missing)") << "\n";
+  }
+
+  std::string sel = "none";
+  if (!wayland.empty() && have_bin("wl-paste"))
+    sel = "wl-paste";
+  else if (!display.empty() && have_bin("xclip"))
+    sel = "xclip";
+  else if (have_bin("wl-paste"))
+    sel = "wl-paste";
+  else if (have_bin("xclip"))
+    sel = "xclip";
+  std::cout << "selection: " << sel << "\n";
+
+  std::cout << "paths:\n";
+  for (const auto &d : keyboop::layout_data_search_paths()) {
+    std::cout << "  data: " << d << (path_ok(d + "/words_en.json") ? " (ok)" : " (missing)")
+              << "\n";
+  }
+#ifdef KEYBOOP_INSTALL_LIBEXECDIR
+  {
+    std::string p = std::string(KEYBOOP_INSTALL_LIBEXECDIR) +
+                    "/ibus-engine-keyboop";
+    std::cout << "  libexec: " << p << (path_ok(p) ? " (ok)" : " (missing)")
+              << "\n";
+  }
+#endif
+  for (const auto &p : keyboop::ibus_component_candidate_paths()) {
+    std::cout << "  ibus-component: " << p
+              << (path_ok(p) ? " (ok)" : " (missing)") << "\n";
+  }
+  for (const auto &p : keyboop::gnome_extension_candidate_paths()) {
+    std::cout << "  extension-dir: " << p
+              << (path_ok(p + "/extension.js") ? " (ok)" : " (missing)")
+              << "\n";
+  }
+  return 0;
+}
+
 static void load_data() {
-  const char *dir = std::getenv("KEYBOOP_DATA_DIR");
-  std::string path = dir ? dir : KEYBOOP_DEFAULT_DATA_DIR;
-  keyboop::LayoutData::shared().load(path);
+  keyboop::LayoutData::shared().load_from_search_path();
 }
 
 static void sync_keymap_from_gnome() {
@@ -50,6 +191,8 @@ int main(int argc, char **argv) {
     std::cout << "keyboopctl 0.1.0\n";
     return 0;
   }
+  if (cmd == "doctor")
+    return cmd_doctor();
 
   if (cmd == "gnome-enable") {
     std::string err;
@@ -94,9 +237,29 @@ int main(int argc, char **argv) {
       }
     }
     std::cout << "auto=" << (s.auto_enabled ? "on" : "off")
-              << " (hotkey Ctrl+Alt+K always works)\n"
+              << " hotkey=" << s.hotkey << "\n"
               << "config: " << keyboop::user_config_path() << "\n"
-              << "Reload: focus another window or ibus restart\n";
+              << "Takes effect on the next key.\n";
+    return 0;
+  }
+  if (cmd == "hotkey") {
+    auto s = keyboop::load_user_settings();
+    if (argc >= 3) {
+      keyboop::HotkeySpec spec;
+      if (!keyboop::parse_hotkey(argv[2], &spec) || !spec.ok()) {
+        std::cerr << "usage: keyboopctl hotkey Control+Alt+k\n";
+        return 1;
+      }
+      s.hotkey = keyboop::format_hotkey(spec);
+      std::string err;
+      if (!keyboop::save_user_settings(s, &err)) {
+        std::cerr << "hotkey: " << err << "\n";
+        return 1;
+      }
+    }
+    std::cout << "hotkey=" << s.hotkey << "\n"
+              << "config: " << keyboop::user_config_path() << "\n"
+              << "Takes effect on the next key.\n";
     return 0;
   }
   if (cmd == "layouts") {
