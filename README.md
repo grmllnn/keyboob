@@ -1,129 +1,246 @@
-# Keyboop (Linux / Wayland)
+# Keyboop (Linux / Wayland & X11)
 
-RU/EN layout auto-switch — Linux port of [Keyboop](https://keyboop.com).
-On **GNOME** it is an **IBus engine** (keeps Shell Super+Space). Optional
-Fcitx5 module for desktops that already use Fcitx.
+Автоматический переключатель раскладки клавиатуры (RU/EN) для Linux — нативный порт [Keyboop](https://keyboop.com).
 
-No clipboard. No root. No raw evdev grab.
+Работает без прав суперпользователя (`root`), без прямого перехвата устройств ввода (`evdev grab`) и без постоянного чтения буфера обмена.
 
-## Status
+## Поддерживаемые окружения и архитектура
 
-| Piece | State |
-|-------|--------|
-| Core + xkb layout pairs | builds + `ctest` |
-| IBus engine (GNOME) | default; keys pass through, convert on Space/Enter/Tab |
-| Fcitx5 addon | optional (`make FCITX=ON`); uses `deleteSurroundingText` |
-| Whisper / translate | not ported |
+| Окружение | Бэкенд ввода | Как работает |
+|---|---|---|
+| **GNOME (Wayland / X11)** | **IBus engine** (по умолчанию) | Интегрируется как IBus-движок. Сохраняет системное переключение по `Super+Space`. Расширение GNOME Shell синхронизирует индикатор раскладки. |
+| **KDE / Hyprland / Sway / wlroots** | **Fcitx5 addon** (опционально) | Модуль для Fcitx5, использующий API `deleteSurroundingText`. |
 
-Supported sessions: GNOME/IBus and KDE/Hyprland/Fcitx5 on Wayland or X11.
-Environments without IBus or Fcitx5 are out of scope. Terminals: auto-convert
-is off; **Ctrl+Alt+K** converts the tracked word only when surrounding text
-at the caret matches it (never stacks on already-typed characters). Arch
-GNOME/Wayland has no runtime smoke here — do not treat Arch as a verified
-session until that check is run there.
+> **Терминалы:** Автоматическая конвертация в эмуляторах терминала отключена во избежание конфликтов. Ручная конвертация последнего набранного слова доступна по горячей клавише (**Ctrl+Alt+K** по умолчанию).
 
-## Dependencies
+---
 
-**Fedora:**
+## Зависимости для сборки
+
+Для сборки требуется компилятор с поддержкой **C++20**, **CMake** (>= 3.20), **Ninja** (или Make), **pkg-config**, **libxkbcommon**, **glib2** и заголовочные файлы выбранного метода ввода (**IBus** или **Fcitx5**).
+
+### Debian / Ubuntu / Linux Mint / Pop!_OS (APT / deb)
 
 ```bash
-sudo dnf install cmake ninja-build gcc-c++ json-devel \
-  libxkbcommon-devel ibus-devel glib2-devel
-# optional: wl-clipboard (Wayland PRIMARY), xclip (X11 PRIMARY)
+sudo apt update
+sudo apt install -y \
+  build-essential \
+  cmake \
+  ninja-build \
+  pkg-config \
+  libxkbcommon-dev \
+  libglib2.0-dev \
+  libibus-1.0-dev \
+  nlohmann-json3-dev
+
+# Опционально: для Fcitx5 бэкенда
+# sudo apt install -y libfcitx5core-dev extra-cmake-modules
+
+# Опциональные утилиты для буфера обмена (PRIMARY selection fallback):
+# sudo apt install -y wl-clipboard xclip
 ```
 
-**Arch:**
+### Fedora / RHEL / AlmaLinux / Rocky Linux (RPM / DNF)
 
 ```bash
-sudo pacman -S --needed base-devel cmake ninja nlohmann-json \
-  libxkbcommon ibus pkgconf
-# optional: wl-clipboard, xclip
+sudo dnf install -y \
+  gcc-c++ \
+  cmake \
+  ninja-build \
+  pkgconf-pkg-config \
+  libxkbcommon-devel \
+  glib2-devel \
+  ibus-devel \
+  json-devel
+
+# Опционально: для Fcitx5 бэкенда
+# sudo dnf install -y fcitx5-devel
+
+# Опциональные утилиты для буфера обмена:
+# sudo dnf install -y wl-clipboard xclip
 ```
 
-Without IBus headers, configure with `make IBUS=OFF` — a requested IBus/Fcitx
-backend fails the build instead of silently skipping.
-
-## Build
+### openSUSE (RPM / Zypper)
 
 ```bash
-make                 # configure + build + ctest (IBus ON, Fcitx OFF)
-make FCITX=ON        # also build Fcitx5 addon
+sudo zypper install -y \
+  gcc-c++ \
+  cmake \
+  ninja \
+  pkg-config \
+  libxkbcommon-devel \
+  glib2-devel \
+  ibus-devel \
+  nlohmann_json-devel
+
+# Опционально: для Fcitx5 бэкенда
+# sudo zypper install -y fcitx5-devel
+
+# Опциональные утилиты:
+# sudo zypper install -y wl-clipboard xclip
+```
+
+### Arch Linux / Manjaro / EndeavourOS (Pacman)
+
+Установка зависимостей через pacman:
+
+```bash
+sudo pacman -S --needed \
+  base-devel \
+  cmake \
+  ninja \
+  pkgconf \
+  libxkbcommon \
+  glib2 \
+  ibus \
+  nlohmann-json
+
+# Опционально: для Fcitx5 бэкенда
+# sudo pacman -S --needed fcitx5
+
+# Опциональные утилиты:
+# sudo pacman -S --needed wl-clipboard xclip
+```
+
+Либо сборка и установка пакета целиком через `PKGBUILD`:
+
+```bash
+makepkg -si
+```
+
+### Nix / NixOS
+
+#### Временное окружение разработки (Nix Shell)
+
+```bash
+nix-shell -p cmake ninja pkg-config gcc libxkbcommon glib ibus nlohmann_json
+```
+
+#### Декларативный `shell.nix`
+
+```nix
+{ pkgs ? import <nixpkgs> {} }:
+
+pkgs.mkShell {
+  nativeBuildInputs = with pkgs; [
+    cmake
+    ninja
+    pkg-config
+  ];
+  buildInputs = with pkgs; [
+    libxkbcommon
+    glib
+    ibus
+    nlohmann_json
+    # fcitx5 # раскомментируйте при сборке с Fcitx5
+    # wl-clipboard # опционально
+    # xclip        # опционально
+  ];
+}
+```
+
+Запуск: `nix-shell` -> `make`.
+
+---
+
+## Сборка и установка
+
+### Вариант 1. Сборка для GNOME (IBus, по умолчанию)
+
+```bash
+# Сборка и прогон тестов
+make
+
+# Установка в систему (по умолчанию PREFIX=/usr)
 sudo make install
-# Do NOT overwrite keyboop.xml with `ibus-engine-keyboop --xml` —
-# that file must stay a full <component>, engines are already inline.
+
+# Обновление кэша IBus компонентов
 ibus write-cache
+
+# Включение IBus-движка Keyboop и установка расширения GNOME Shell
 keyboopctl gnome-enable
-# gnome-enable also installs keyboop-switch@keyboop (GNOME Shell extension).
-# Wayland cannot reload new extensions live — log out and back in once,
-# then confirm:
-#   gnome-extensions info keyboop-switch@keyboop   # State: ACTIVE
+
+# ВАЖНО: На Wayland GNOME Shell не может подгрузить новые расширения на лету.
+# Завершите сеанс (Log Out) и войдите снова, либо перезагрузитесь.
+
+# После повторного входа перезапустите демон IBus:
 ibus restart
-keyboopctl doctor    # session, IM, layouts, extension, paths
-```
 
-Without that extension, convert still rewrites text, but the panel/layout
-stays on the old source (IBus alone is not enough on GNOME Wayland).
-
-Disable / restore GNOME xkb sources:
-
-```bash
-keyboopctl gnome-disable
-```
-
-## How layouts work
-
-Backend is chosen from session capabilities (desktop + IM modules), not from
-the distro. On GNOME, Keyboop reads `org.gnome.desktop.input-sources`, builds
-a Latin↔Cyrillic keymap pair via **xkbcommon**, and registers one IBus engine
-per source (`keyboop:us`, `keyboop:ru`, …). GNOME still switches with
-Super+Space. On Fcitx5, the pair and target IM come from the current Fcitx
-group (`keyboard-us`, `keyboard-ru-phonetic`, …).
-
-```bash
-keyboopctl layouts          # show sources + detected pair
-keyboopctl auto off         # disable auto-convert on space
-keyboopctl auto on          # same file: ~/.config/keyboop/config
-keyboopctl hotkey Control+Alt+k
-# GNOME: extension prefs → auto toggle + shortcut button write that file too
-keyboopctl convert ghbdtn   # → привет (using active/xkb pair)
+# Проверьте статус всех компонентов:
 keyboopctl doctor
 ```
 
-Dictionaries for auto-decide are still EN/RU (good enough for us/ru; weaker
-for de/ua until more wordlists land).
-
-Manual convert: default **Ctrl+Alt+K** (same physical key on RU — `л` too).
-Change it in extension prefs or `keyboopctl hotkey`. The current word is
-replaced only if surrounding text at the caret matches it,
-or via suffix Backspace when the app does not report surrounding text.
-Otherwise it is a no-op, not a second insert. For other committed text it
-uses a validated UTF-8 snapshot (IBus selection, or PRIMARY via `wl-paste` /
-`xclip` only when it matches surrounding text). Stale PRIMARY is ignored.
-
-## Fcitx5 (not for GNOME)
-
-If you already run Fcitx on KDE/Hyprland:
+### Вариант 2. Сборка для KDE / Hyprland / Sway (Fcitx5)
 
 ```bash
+# Сборка без IBus с включенным Fcitx5-модулем
 make FCITX=ON IBUS=OFF
+
+# Установка
 sudo make install
-# enable addon in fcitx5-configtool; do NOT use on GNOME
+
+# Перезапуск Fcitx5
+fcitx5 -r -d
+
+# Включите аддон Keyboop в fcitx5-configtool (если не активировался автоматически)
 ```
 
-## Manual GNOME app checklist
+---
 
-Unit tests and `keyboopctl` smoke do not drive a GUI session. After install,
-on Fedora GNOME / IBus / Wayland, check by hand:
+## Управление и настройка (`keyboopctl`)
 
-- [ ] GTK3 and GTK4 text fields: type `ghbdtn` + Space → `привет `; layout switches; no underline while typing
-- [ ] Firefox: same auto-convert; Ctrl+Alt+K on a selected wrong-layout word
-- [ ] Chromium or Electron: auto-convert; mid-phrase hotkey without eating neighbors
-- [ ] Qt (Kate, Telegram, …): auto-convert on the **first** Space, not the second
-- [ ] Terminal (GNOME Terminal / Ptyxis): typing is unchanged; Ctrl+Alt+K converts
-- [ ] Password/PIN fields: no convert, no underline
-- [ ] Super+Space mid-word: unfinished word stays as typed, not dropped
-- [ ] `keyboopctl doctor`: session, IM, layouts, extension=ok, data path ok
+Утилита командной строки `keyboopctl` управляет настройками и диагностирует состояние:
 
-## License
+```bash
+# Полная диагностика окружения, IBus/Fcitx, путей к данным и расширения GNOME
+keyboopctl doctor
 
-MIT — see `LICENSE` and `THIRD_PARTY.md`.
+# Показать текущие источники ввода и обнаруженную пару раскладок (Latin ↔ Cyrillic)
+keyboopctl layouts
+
+# Включить / выключить автоконвертацию по нажатию пробела:
+keyboopctl auto on
+keyboopctl auto off
+
+# Назначить комбинацию клавиш для ручной конвертации (по умолчанию Control+Alt+k):
+keyboopctl hotkey Control+Alt+k
+
+# Ручная конвертация слова через активную раскладку
+keyboopctl convert ghbdtn    # Выведет: привет
+
+# Проверка решения языкового детектора
+keyboopctl decide ghbdtn     # Выведет: to-ru
+
+# Откат системных источников ввода GNOME к стандартным xkb:
+keyboopctl gnome-disable
+```
+
+Конфигурация пользователя сохраняется в файле `~/.config/keyboop/config` и применяется мгновенно при следующем нажатии клавиши.
+
+---
+
+## Принцип работы
+
+1. **Определение пары раскладок:** Keyboop считывает системные источники ввода (в GNOME через GSettings `org.gnome.desktop.input-sources`, в Fcitx5 через текущую группу) и строит таблицу соответствия символов Latin ↔ Cyrillic с помощью `libxkbcommon`.
+2. **Анализ текста:** При вводе слова формируется буфер. При нажатии разделителя (Space, Enter, Tab) движок анализирует n-граммы и словари.
+3. **Замена текста:**
+   - В IBus: заменяется слово в окружающем контексте (`surrounding text`), либо отправляется серия Backspace и новый текст, если приложение не отдает контекст.
+   - В Fcitx5: вызывается `deleteSurroundingText`.
+4. **Синхронизация индикатора GNOME:** Расширение Shell (`keyboop-switch@keyboop`) переключает активный источник ввода в интерфейсе GNOME при смене языка.
+
+---
+
+## Чек-лист проверки после установки (GNOME)
+
+- [ ] Поле ввода GTK3/GTK4: наберите `ghbdtn` + Space → текст заменится на `привет `, индикатор раскладки переключится.
+- [ ] Браузеры (Firefox, Chromium): автоконвертация работает, горячая клавиша `Ctrl+Alt+K` конвертирует выделенное или текущее слово.
+- [ ] Qt-приложения (Kate, Telegram Desktop): корректная автоконвертация с первого нажатия пробела.
+- [ ] Эмуляторы терминала (Ptyxis, GNOME Terminal): автоконвертация не мешает работе команд; по `Ctrl+Alt+K` конвертирует набранное слово.
+- [ ] Поля паролей: конвертация отключена, символы не перехватываются.
+- [ ] `keyboopctl doctor`: все проверки зелёные (`ok`).
+
+---
+
+## Лицензия
+
+Проект распространяется под лицензией [MIT](LICENSE). Информация о сторонних компонентах доступна в [THIRD_PARTY.md](THIRD_PARTY.md).
