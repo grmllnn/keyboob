@@ -349,12 +349,50 @@ inline LayoutFlipAt layout_flip_at(std::string_view phrase, size_t cursor_cp) {
   size_t lo = anchor;
   size_t hi = anchor + 1;
 
-  // One token: letters plus attached punctuation (hf,jnftn, xtuj-b,elm).
-  // Spaces do not glue words — selecting "gbitv" must not eat "xtuj-b,elm".
+  auto get_token_script = [&](size_t from, int dir) -> int {
+    int detected = 0;
+    size_t i = from;
+    while (true) {
+      if (cps[i].cp == ' ' || cps[i].cp == '\t' || cps[i].cp == '\n' || cps[i].cp == '\r')
+        break;
+      int sc = letter_script(cps[i].cp);
+      if (sc != 0) {
+        if (detected == 0)
+          detected = sc;
+        else if (detected != sc)
+          return -1;
+      }
+      if (dir < 0) {
+        if (i == 0)
+          break;
+        --i;
+      } else {
+        ++i;
+        if (i >= cps.size())
+          break;
+      }
+    }
+    return detected;
+  };
+
+  // Expanding left: allow spaces only if preceded by the same script (want)
   while (lo > 0) {
     uint32_t cp = cps[lo - 1].cp;
-    if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r')
+    if (cp == '\n' || cp == '\r')
       break;
+    if (cp == ' ' || cp == '\t') {
+      size_t k = lo - 1;
+      while (k > 0 && (cps[k - 1].cp == ' ' || cps[k - 1].cp == '\t'))
+        --k;
+      if (k > 0) {
+        int sc = get_token_script(k - 1, -1);
+        if (sc == want) {
+          lo = k;
+          continue;
+        }
+      }
+      break;
+    }
     int sc = letter_script(cp);
     if (sc == want || sc == 0)
       --lo;
@@ -362,10 +400,24 @@ inline LayoutFlipAt layout_flip_at(std::string_view phrase, size_t cursor_cp) {
       break;
   }
 
+  // Expanding right: allow spaces only if followed by the same script (want)
   while (hi < cps.size()) {
     uint32_t cp = cps[hi].cp;
-    if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r')
+    if (cp == '\n' || cp == '\r')
       break;
+    if (cp == ' ' || cp == '\t') {
+      size_t k = hi + 1;
+      while (k < cps.size() && (cps[k].cp == ' ' || cps[k].cp == '\t'))
+        ++k;
+      if (k < cps.size()) {
+        int sc = get_token_script(k, +1);
+        if (sc == want) {
+          hi = k;
+          continue;
+        }
+      }
+      break;
+    }
     int sc = letter_script(cp);
     if (sc == want || sc == 0)
       ++hi;

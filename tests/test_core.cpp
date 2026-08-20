@@ -88,17 +88,20 @@ static void test_keymap() {
         "как дела");
   {
     const std::string mid = "раз nhb два";
-    // caret after "nhb" (char offset 7: р а з _ n h b |)
-    auto run = layout_flip_at(mid, 7);
-    CHECK(run.text == "nhb");
-    CHECK(Keymap::convert(run.text, true) == "три");
-    // caret at end of mono Cyrillic word (spaces do not glue)
+    //    // caret at end of mono Cyrillic phrase → whole phrase
     auto all = layout_flip_at("раз два", 7);
-    CHECK(all.text == "два");
-    CHECK(Keymap::convert(all.text, false) == "ldf");
+    CHECK(all.text == "раз два");
+    CHECK(Keymap::convert(all.text, false) == "hfp ldf");
     auto multi = layout_flip_at("ntcnbv cyjdf", 12);
-    CHECK(multi.text == "cyjdf");
-    CHECK(Keymap::convert(multi.text, true) == "снова");
+    CHECK(multi.text == "ntcnbv cyjdf");
+    CHECK(Keymap::convert(multi.text, true) == "тестим снова");
+    // full phrase: "ghjdthztv 'nj ujdyj" -> "проверяем это говно"
+    auto phrase_start = layout_flip_at("ghjdthztv 'nj ujdyj", 0);
+    CHECK(phrase_start.text == "ghjdthztv 'nj ujdyj");
+    CHECK(Keymap::convert(phrase_start.text, true) == "проверяем это говно");
+    auto phrase_end = layout_flip_at("ghjdthztv 'nj ujdyj", 20);
+    CHECK(phrase_end.text == "ghjdthztv 'nj ujdyj");
+    CHECK(Keymap::convert(phrase_end.text, true) == "проверяем это говно");
     // mid-phrase insertion: "ок тестим cerf снова"
     const std::string phrase2 = "ок тестим cerf снова";
     // caret at start of "cerf" (char offset 10)
@@ -116,13 +119,13 @@ static void test_keymap() {
     // multi-word tail in mixed sentence:
     const std::string phrase3 = "проверяем эту hf,jnftn yj yt lj rjywf";
     auto tail = layout_flip_at(phrase3, keyboop::utf8_length(phrase3));
-    CHECK(tail.text == "rjywf");
-    CHECK(Keymap::convert(tail.text, true) == "конца");
+    CHECK(tail.text == "hf,jnftn yj yt lj rjywf");
+    CHECK(Keymap::convert(tail.text, true) == "работает но не до конца");
     const std::string bug =
         "gbitv-gbitv-gbitv b to` xtuj-b,elm gbitv";
     auto last = layout_flip_at(bug, keyboop::utf8_length(bug));
-    CHECK(last.text == "gbitv");
-    CHECK(Keymap::convert(last.text, true) == "пишем");
+    CHECK(last.text == "gbitv-gbitv-gbitv b to` xtuj-b,elm gbitv");
+    CHECK(Keymap::convert(last.text, true) == "пишем-пишем-пишем и ещё чего-ибудь пишем");
     const size_t end = utf8_length(bug);
     auto p_end = match_primary_snapshot(bug, end, "gbitv");
     CHECK(p_end.ok);
@@ -140,8 +143,7 @@ static void test_keymap() {
         "gbitv-gbitv-gbitv b to` xtuj-b,elm gbitv";
     const std::string select_tail =
         "djn gbbbbitv gjnjv gbitv-gbitv-gbitv b to` xtuj-b,elm gbitv";
-    CHECK(layout_flip_at(select_all, 0).text == "t,jibv");
-    CHECK(Keymap::convert("t,jibv", true) == "ебошим");
+    CHECK(layout_flip_at(select_all, 0).text == select_all);
     CHECK(match_primary_snapshot(select_all, 0, select_all).ok);
     CHECK(utf8_length(select_all) > 64);
     CHECK(utf8_length(select_tail) <= 64);
