@@ -627,33 +627,37 @@ static void handle_manual(IBusEngine *engine, KeyboopEngine *self) {
     return;
   }
 
-  // If we have a buffered word in keystroke history (typing without surrounding text, e.g. Chrome):
-  if (self->core) {
-    if (auto act = self->core->manual_convert()) {
-      if (st)
-        g_object_unref(st);
-      if (apply_expected_replace(engine, self, act->expected, act->replacement)) {
-        maybe_switch_layout(act->switch_to_cyrillic);
-        self->core->clear_context();
-      }
-      return;
-    }
-  }
-
   if (txt) {
     auto run = keyboop::layout_flip_at(txt, cursor);
     if (!run.text.empty() && keyboop::utf8_valid(run.text)) {
       std::string converted = keymap_flip(run.text);
       if (!converted.empty()) {
         const bool to_cyr = flip_to_cyrillic(run.text);
-        replace_char_range(engine, self, cursor,
-                           static_cast<guint>(run.start_cp),
-                           static_cast<guint>(run.end_cp), run.text,
-                           converted);
-        maybe_switch_layout(to_cyr);
-        if (self->core)
-          self->core->clear_context();
+        if (replace_char_range(engine, self, cursor,
+                               static_cast<guint>(run.start_cp),
+                               static_cast<guint>(run.end_cp), run.text,
+                               converted)) {
+          maybe_switch_layout(to_cyr);
+          if (self->core)
+            self->core->clear_context();
+          if (st)
+            g_object_unref(st);
+          return;
+        }
       }
+    }
+  }
+
+  // Fallback for apps without surrounding text (Chrome web inputs):
+  if (self->core) {
+    if (auto act = self->core->manual_convert()) {
+      if (apply_expected_replace(engine, self, act->expected, act->replacement)) {
+        maybe_switch_layout(act->switch_to_cyrillic);
+        self->core->clear_context();
+      }
+      if (st)
+        g_object_unref(st);
+      return;
     }
   }
   if (st)
