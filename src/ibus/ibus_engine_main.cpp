@@ -627,25 +627,12 @@ static void handle_manual(IBusEngine *engine, KeyboopEngine *self) {
     return;
   }
 
-  if (self->core && !self->core->buffer().current_word().empty()) {
-    const std::string word = self->core->buffer().current_word();
-    if (txt) {
-      auto span = keyboop::match_span_touching_caret(txt, cursor, word);
-      if (span.ok) {
-        if (auto act = self->core->manual_convert()) {
-          if (st)
-            g_object_unref(st);
-          if (apply_expected_replace(engine, self, word, act->replacement)) {
-            maybe_switch_layout(act->switch_to_cyrillic);
-            self->core->clear_context();
-          }
-          return;
-        }
-      }
-    } else if (auto act = self->core->manual_convert()) {
+  // If we have a buffered word in keystroke history (typing without surrounding text, e.g. Chrome):
+  if (self->core) {
+    if (auto act = self->core->manual_convert()) {
       if (st)
         g_object_unref(st);
-      if (apply_expected_replace(engine, self, word, act->replacement)) {
+      if (apply_expected_replace(engine, self, act->expected, act->replacement)) {
         maybe_switch_layout(act->switch_to_cyrillic);
         self->core->clear_context();
       }
